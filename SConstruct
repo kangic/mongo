@@ -2230,10 +2230,6 @@ checkErrorCodes()
 # --- lint ----
 
 def doLint( env , target , source ):
-    import buildscripts.clang_format
-    if not buildscripts.clang_format.lint(None, []):
-        raise Exception("clang-format lint errors")
-
     import buildscripts.lint
     if not buildscripts.lint.run_lint( [ "src/mongo/" ] ):
         raise Exception( "lint errors" )

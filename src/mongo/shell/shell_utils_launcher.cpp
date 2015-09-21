@@ -55,6 +55,7 @@
 #include "mongo/shell/shell_utils.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/log.h"
+#include "mongo/util/net/hostandport.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/signal_win32.h"
@@ -180,8 +181,7 @@ void goingAwaySoon() {
 
 void ProgramOutputMultiplexer::appendLine(int port, ProcessId pid, const char* line) {
     stdx::lock_guard<stdx::mutex> lk(mongoProgramOutputMutex);
-    if (mongo::dbexitCalled)
-        throw "program is terminating";
+    uassert(28695, "program is terminating", !mongo::dbexitCalled);
     stringstream buf;
     if (port > 0)
         buf << " m" << port << "| " << line;
@@ -471,11 +471,16 @@ void ProgramRunner::launchProcess(int child_stdout) {
     verify(nativePid != -1);
     if (nativePid == 0) {
         // DON'T ASSERT IN THIS BLOCK - very bad things will happen
+        //
+        // Also, deliberately call _exit instead of quickExit. We intended to
+        // fork() and exec() here, so we never want to run any form of cleanup.
+        // This includes things that quickExit calls, such as atexit leak
+        // checks.
 
         if (dup2(child_stdout, STDOUT_FILENO) == -1 || dup2(child_stdout, STDERR_FILENO) == -1) {
             // Async signal unsafe code reporting a terminal error condition.
             cout << "Unable to dup2 child output: " << errnoWithDescription() << endl;
-            quickExit(-1);  // do not pass go, do not call atexit handlers
+            _exit(-1);  // do not pass go, do not call atexit handlers
         }
 
         // NOTE execve is async signal safe, but it is not clear that execvp is async
@@ -484,7 +489,8 @@ void ProgramRunner::launchProcess(int child_stdout) {
 
         // Async signal unsafe code reporting a terminal error condition.
         cout << "Unable to start program " << argv[0] << ' ' << errnoWithDescription() << endl;
-        quickExit(-1);
+
+        _exit(-1);
     }
 
 #endif
@@ -521,8 +527,15 @@ bool wait_for_pid(ProcessId pid, bool block = true, int* exit_code = NULL) {
 #else
     int tmp;
     bool ret = (pid.toNative() == waitpid(pid.toNative(), &tmp, (block ? 0 : WNOHANG)));
-    if (exit_code)
-        *exit_code = WEXITSTATUS(tmp);
+    if (ret && exit_code) {
+        if (WIFEXITED(tmp)) {
+            *exit_code = WEXITSTATUS(tmp);
+        } else if (WIFSIGNALED(tmp)) {
+            *exit_code = -WTERMSIG(tmp);
+        } else {
+            MONGO_UNREACHABLE;
+        }
+    }
     return ret;
 
 #endif
@@ -558,6 +571,7 @@ BSONObj StartMongoProgram(const BSONObj& a, void* data) {
     ProgramRunner r(a);
     r.start();
     stdx::thread t(r);
+    t.detach();
     return BSON(string("") << r.pid().asLongLong());
 }
 
@@ -565,6 +579,7 @@ BSONObj RunMongoProgram(const BSONObj& a, void* data) {
     ProgramRunner r(a);
     r.start();
     stdx::thread t(r);
+    t.detach();
     int exit_code = -123456;  // sentinel value
     wait_for_pid(r.pid(), true, &exit_code);
     if (r.port() > 0) {
@@ -579,6 +594,7 @@ BSONObj RunProgram(const BSONObj& a, void* data) {
     ProgramRunner r(a);
     r.start();
     stdx::thread t(r);
+    t.detach();
     int exit_code = -123456;  // sentinel value
     wait_for_pid(r.pid(), true, &exit_code);
     registry.deletePid(r.pid());
@@ -661,7 +677,7 @@ inline void kill_wrapper(ProcessId pid, int sig, int port, const BSONObj& opt) {
             //
             try {
                 DBClientConnection conn;
-                conn.connect("127.0.0.1:" + BSONObjBuilder::numStr(port));
+                conn.connect(HostAndPort{"127.0.0.1:" + BSONObjBuilder::numStr(port)});
 
                 BSONElement authObj = opt["auth"];
 

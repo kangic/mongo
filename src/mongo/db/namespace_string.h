@@ -94,9 +94,6 @@ public:
         return _ns;
     }
 
-    operator const std::string&() const {
-        return ns();
-    }
     const std::string& toString() const {
         return ns();
     }
@@ -104,6 +101,12 @@ public:
     size_t size() const {
         return _ns.size();
     }
+
+    struct Hasher {
+        size_t operator()(const NamespaceString& nss) const {
+            return std::hash<std::string>()(nss._ns);
+        }
+    };
 
     //
     // The following methods assume isValid() is true for this NamespaceString.
@@ -139,14 +142,14 @@ public:
     bool isNormal() const {
         return normal(_ns);
     }
-    bool isListCollectionsGetMore() const;
-    bool isListIndexesGetMore() const;
+    bool isListCollectionsCursorNS() const;
+    bool isListIndexesCursorNS() const;
 
     /**
-     * Given a NamespaceString for which isListIndexesGetMore() returns true, returns the
-     * NamespaceString for the collection that the "listIndexesGetMore" targets.
+     * Given a NamespaceString for which isListIndexesCursorNS() returns true, returns the
+     * NamespaceString for the collection that the "listIndexes" targets.
      */
-    NamespaceString getTargetNSForListIndexesGetMore() const;
+    NamespaceString getTargetNSForListIndexes() const;
 
     /**
      * @return true if the namespace is valid. Special namespaces for internal use are considered as
@@ -266,7 +269,6 @@ private:
     size_t _dotIndex;
 };
 
-
 // "database.a.b.c" -> "database"
 inline StringData nsToDatabaseSubstring(StringData ns) {
     size_t i = ns.find('.');
@@ -347,7 +349,7 @@ struct NamespaceDBEquals {
         return nsDBEquals(a, b);
     }
 };
-}
 
+}  // namespace mongo
 
 #include "mongo/db/namespace_string-inl.h"

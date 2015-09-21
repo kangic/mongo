@@ -38,6 +38,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
 #include "mongo/dbtests/dbtests.h"
+#include "mongo/platform/decimal128.h"
 #include "mongo/util/log.h"
 
 
@@ -163,6 +164,15 @@ public:
     }
 };
 
+class NumberLongStrictZero {
+public:
+    void run() {
+        BSONObjBuilder b;
+        b.append("a", 0LL);
+        ASSERT_EQUALS("{ \"a\" : { \"$numberLong\" : \"0\" } }", b.done().jsonString(Strict));
+    }
+};
+
 class NumberLongStrict {
 public:
     void run() {
@@ -189,6 +199,26 @@ public:
         BSONObjBuilder b;
         b.append("a", -20000LL);
         ASSERT_EQUALS("{ \"a\" : { \"$numberLong\" : \"-20000\" } }", b.done().jsonString(Strict));
+    }
+};
+
+class NumberDecimal {
+public:
+    void run() {
+        BSONObjBuilder b;
+        b.append("a", mongo::Decimal128("123456789.12345"));
+        ASSERT_EQUALS("{ \"a\" : NumberDecimal(\"123456789.12345\") }",
+                      b.done().jsonString(TenGen));
+    }
+};
+
+class NumberDecimalStrict {
+public:
+    void run() {
+        BSONObjBuilder b;
+        b.append("a", mongo::Decimal128("123456789.12345"));
+        ASSERT_EQUALS("{ \"a\" : { \"$numberDecimal\" : \"123456789.12345\" } }",
+                      b.done().jsonString(Strict));
     }
 };
 
@@ -577,7 +607,8 @@ public:
         b.append("r", (int)5);
         b.appendTimestamp("s", 123123123123123LL);
         b.append("t", 12321312312LL);
-        b.appendMaxKey("u");
+        b.append("u", "123456789.12345");
+        b.appendMaxKey("v");
 
         BSONObj o = b.obj();
         o.jsonString();
@@ -1698,7 +1729,7 @@ class DateNegative : public Base {
 class NumberLongTest : public Base {
     virtual BSONObj bson() const {
         BSONObjBuilder b;
-        b.appendNumber("a", 20000LL);
+        b.append("a", 20000LL);
         return b.obj();
     }
     virtual string json() const {
@@ -1709,7 +1740,7 @@ class NumberLongTest : public Base {
 class NumberLongMin : public Base {
     virtual BSONObj bson() const {
         BSONObjBuilder b;
-        b.appendNumber("a", std::numeric_limits<long long>::min());
+        b.append("a", std::numeric_limits<long long>::min());
         return b.obj();
     }
     virtual string json() const {
@@ -1735,7 +1766,7 @@ class NumberIntTest : public Base {
 class NumberLongNeg : public Base {
     virtual BSONObj bson() const {
         BSONObjBuilder b;
-        b.appendNumber("a", -20000LL);
+        b.append("a", -20000LL);
         return b.obj();
     }
     virtual string json() const {
@@ -2477,7 +2508,7 @@ public:
 class NumericLongMin : public Base {
     virtual BSONObj bson() const {
         BSONObjBuilder b;
-        b.appendNumber("a", std::numeric_limits<long long>::min());
+        b.append("a", std::numeric_limits<long long>::min());
         return b.obj();
     }
     virtual string json() const {
@@ -2682,9 +2713,16 @@ public:
         add<JsonStringTests::InvalidNumbers>();
         add<JsonStringTests::NumberPrecision>();
         add<JsonStringTests::NegativeNumber>();
+        add<JsonStringTests::NumberLongStrictZero>();
         add<JsonStringTests::NumberLongStrict>();
         add<JsonStringTests::NumberLongStrictLarge>();
         add<JsonStringTests::NumberLongStrictNegative>();
+
+        if (Decimal128::enabled) {
+            add<JsonStringTests::NumberDecimal>();
+            add<JsonStringTests::NumberDecimalStrict>();
+        }
+
         add<JsonStringTests::NumberDoubleNaN>();
         add<JsonStringTests::NumberDoubleInfinity>();
         add<JsonStringTests::NumberDoubleNegativeInfinity>();

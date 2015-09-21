@@ -68,9 +68,6 @@ public:
      */
     static ReplicaSetConfig assertMakeRSConfig(const BSONObj& configBSON);
 
-    ReplCoordTest();
-    virtual ~ReplCoordTest();
-
 protected:
     virtual void setUp();
     virtual void tearDown();
@@ -80,6 +77,13 @@ protected:
      */
     executor::NetworkInterfaceMock* getNet() {
         return _net;
+    }
+
+    /**
+     * Gets the replication executor under test.
+     */
+    ReplicationExecutor* getReplExec() {
+        return _replExec.get();
     }
 
     /**
@@ -158,6 +162,19 @@ protected:
     void start(const HostAndPort& selfHost);
 
     /**
+     * Brings the TopologyCoordinator from follower to candidate by simulating a period of time in
+     * which the election timer expires and starts a dry run election.
+     * Returns after dry run is completed but before actual election starts.
+     * If 'onDryRunRequest' is provided, this function is invoked with the
+     * replSetRequestVotes network request before simulateSuccessfulDryRun() simulates
+     * a successful dry run vote response.
+     * Applicable to protocol version 1 only.
+     */
+    void simulateSuccessfulDryRun(
+        stdx::function<void(const executor::RemoteCommandRequest& request)> onDryRunRequest);
+    void simulateSuccessfulDryRun();
+
+    /**
      * Brings the repl coord from SECONDARY to PRIMARY by simulating the messages required to
      * elect it.
      *
@@ -165,12 +182,6 @@ protected:
      */
     void simulateSuccessfulElection();
     void simulateSuccessfulV1Election();
-
-    /**
-     * Brings the repl coord from PRIMARY to SECONDARY by simulating a period of time in which
-     * all heartbeats respond with an error condition, such as time out.
-     */
-    void simulateStepDownOnIsolation();
 
     /**
      * Asserts that calling start(configDoc, selfHost) successfully initiates the
@@ -188,18 +199,25 @@ protected:
      */
     int64_t countLogLinesContaining(const std::string& needle);
 
+    /**
+     * Receive the heartbeat request from replication coordinator and reply with a response.
+     */
+    void replyToReceivedHeartbeat();
+    void replyToReceivedHeartbeatV1();
+
 private:
     std::unique_ptr<ReplicationCoordinatorImpl> _repl;
     // Owned by ReplicationCoordinatorImpl
-    TopologyCoordinatorImpl* _topo;
+    TopologyCoordinatorImpl* _topo = nullptr;
+    // Owned by ReplicationExecutor
+    executor::NetworkInterfaceMock* _net = nullptr;
+    // Owned by ReplicationExecutor
+    StorageInterfaceMock* _storage = nullptr;
+    std::unique_ptr<ReplicationExecutor> _replExec;
     // Owned by ReplicationCoordinatorImpl
-    executor::NetworkInterfaceMock* _net;
-    // Owned by ReplicationCoordinatorImpl
-    StorageInterfaceMock* _storage;
-    // Owned by ReplicationCoordinatorImpl
-    ReplicationCoordinatorExternalStateMock* _externalState;
+    ReplicationCoordinatorExternalStateMock* _externalState = nullptr;
     ReplSettings _settings;
-    bool _callShutdown;
+    bool _callShutdown = false;
 };
 
 }  // namespace repl

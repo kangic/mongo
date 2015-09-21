@@ -28,6 +28,8 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/client/read_preference.h"
+#include "mongo/client/remote_command_targeter.h"
 #include "mongo/db/commands.h"
 #include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_registry.h"
@@ -84,12 +86,17 @@ public:
         grid.shardRegistry()->getAllShardIds(&shardIds);
 
         for (const ShardId& shardId : shardIds) {
-            const auto s = grid.shardRegistry()->getShard(shardId);
+            const auto s = grid.shardRegistry()->getShard(txn, shardId);
             if (!s) {
                 continue;
             }
 
-            BSONObj x = s->runCommand("admin", "fsync");
+            const auto shardHost = uassertStatusOK(
+                s->getTargeter()->findHost({ReadPreference::PrimaryOnly, TagSet::primaryOnly()}));
+
+            BSONObj x = uassertStatusOK(
+                grid.shardRegistry()->runCommand(txn, shardHost, "admin", BSON("fsync" << 1)));
+
             sub.append(s->getId(), x);
 
             if (!x["ok"].trueValue()) {
@@ -105,7 +112,7 @@ public:
         return ok;
     }
 
-} fsyncCmd;
+} clusterFsyncCmd;
 
 }  // namespace
 }  // namespace mongo

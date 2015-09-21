@@ -55,6 +55,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/query/plan_executor.h"
+#include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -62,6 +63,20 @@ namespace mongo {
 using std::unique_ptr;
 using std::string;
 using std::vector;
+using stdx::make_unique;
+
+namespace {
+
+BSONObj stripFieldNames(const BSONObj& obj) {
+    BSONObjIterator it(obj);
+    BSONObjBuilder bob;
+    while (it.more()) {
+        bob.appendAs(it.next(), "");
+    }
+    return bob.obj();
+}
+
+}  // namespace
 
 /**
  * A command for manually constructing a query tree and running it.
@@ -91,7 +106,7 @@ using std::vector;
  * node -> {skip: {args: {node: node, num: posint}}}
  * node -> {sort: {args: {node: node, pattern: objWithSortCriterion }}}
  * node -> {mergeSort: {args: {nodes: [node, node], pattern: objWithSortCriterion}}}
- * node -> {delete: {args: {node: node, isMulti: bool, shouldCallLogOp: bool}}}
+ * node -> {delete: {args: {node: node, isMulti: bool}}}
  *
  * Forthcoming Nodes:
  *
@@ -168,13 +183,13 @@ public:
 
         // Add a fetch at the top for the user so we can get obj back for sure.
         // TODO: Do we want to do this for the user?  I think so.
-        PlanStage* rootFetch = new FetchStage(txn, ws.get(), userRoot, NULL, collection);
+        unique_ptr<PlanStage> rootFetch =
+            make_unique<FetchStage>(txn, ws.get(), userRoot, nullptr, collection);
 
-        PlanExecutor* rawExec;
-        Status execStatus = PlanExecutor::make(
-            txn, ws.release(), rootFetch, collection, PlanExecutor::YIELD_AUTO, &rawExec);
-        fassert(28536, execStatus);
-        std::unique_ptr<PlanExecutor> exec(rawExec);
+        auto statusWithPlanExecutor = PlanExecutor::make(
+            txn, std::move(ws), std::move(rootFetch), collection, PlanExecutor::YIELD_AUTO);
+        fassert(28536, statusWithPlanExecutor.getStatus());
+        std::unique_ptr<PlanExecutor> exec = std::move(statusWithPlanExecutor.getValue());
 
         BSONArrayBuilder resultBuilder(result.subarrayStart("results"));
 
@@ -228,13 +243,14 @@ public:
             }
             BSONObj argObj = e.Obj();
             if (filterTag == e.fieldName()) {
-                StatusWithMatchExpression swme = MatchExpressionParser::parse(
+                StatusWithMatchExpression statusWithMatcher = MatchExpressionParser::parse(
                     argObj, WhereCallbackReal(txn, collection->ns().db()));
-                if (!swme.isOK()) {
+                if (!statusWithMatcher.isOK()) {
                     return NULL;
                 }
+                std::unique_ptr<MatchExpression> me = std::move(statusWithMatcher.getValue());
                 // exprs is what will wind up deleting this.
-                matcher = swme.getValue();
+                matcher = me.release();
                 verify(NULL != matcher);
                 exprs->mutableVector().push_back(matcher);
             } else if (argsTag == e.fieldName()) {
@@ -260,8 +276,8 @@ public:
             IndexScanParams params;
             params.descriptor = desc;
             params.bounds.isSimpleRange = true;
-            params.bounds.startKey = nodeArgs["startKey"].Obj();
-            params.bounds.endKey = nodeArgs["endKey"].Obj();
+            params.bounds.startKey = stripFieldNames(nodeArgs["startKey"].Obj());
+            params.bounds.endKey = stripFieldNames(nodeArgs["endKey"].Obj());
             params.bounds.endKeyInclusive = nodeArgs["endKeyInclusive"].Bool();
             params.direction = nodeArgs["direction"].numberInt();
 
@@ -270,7 +286,7 @@ public:
             uassert(
                 16921, "Nodes argument must be provided to AND", nodeArgs["nodes"].isABSONObj());
 
-            unique_ptr<AndHashStage> andStage(new AndHashStage(workingSet, collection));
+            auto andStage = make_unique<AndHashStage>(txn, workingSet, collection);
 
             int nodesAdded = 0;
             BSONObjIterator it(nodeArgs["nodes"].Obj());
@@ -293,7 +309,7 @@ public:
             uassert(
                 16924, "Nodes argument must be provided to AND", nodeArgs["nodes"].isABSONObj());
 
-            unique_ptr<AndSortedStage> andStage(new AndSortedStage(workingSet, collection));
+            auto andStage = make_unique<AndSortedStage>(txn, workingSet, collection);
 
             int nodesAdded = 0;
             BSONObjIterator it(nodeArgs["nodes"].Obj());
@@ -317,7 +333,7 @@ public:
                 16934, "Nodes argument must be provided to AND", nodeArgs["nodes"].isABSONObj());
             uassert(16935, "Dedup argument must be provided to OR", !nodeArgs["dedup"].eoo());
             BSONObjIterator it(nodeArgs["nodes"].Obj());
-            unique_ptr<OrStage> orStage(new OrStage(workingSet, nodeArgs["dedup"].Bool(), matcher));
+            auto orStage = make_unique<OrStage>(txn, workingSet, nodeArgs["dedup"].Bool(), matcher);
             while (it.more()) {
                 BSONElement e = it.next();
                 if (!e.isABSONObj()) {
@@ -336,6 +352,9 @@ public:
                 16929, "Node argument must be provided to fetch", nodeArgs["node"].isABSONObj());
             PlanStage* subNode =
                 parseQuery(txn, collection, nodeArgs["node"].Obj(), workingSet, exprs);
+            uassert(28731,
+                    "Can't parse sub-node of FETCH: " + nodeArgs["node"].Obj().toString(),
+                    NULL != subNode);
             return new FetchStage(txn, workingSet, subNode, matcher, collection);
         } else if ("limit" == nodeName) {
             uassert(
@@ -345,7 +364,10 @@ public:
             uassert(16931, "Num argument must be provided to limit", nodeArgs["num"].isNumber());
             PlanStage* subNode =
                 parseQuery(txn, collection, nodeArgs["node"].Obj(), workingSet, exprs);
-            return new LimitStage(nodeArgs["num"].numberInt(), workingSet, subNode);
+            uassert(28732,
+                    "Can't parse sub-node of LIMIT: " + nodeArgs["node"].Obj().toString(),
+                    NULL != subNode);
+            return new LimitStage(txn, nodeArgs["num"].numberInt(), workingSet, subNode);
         } else if ("skip" == nodeName) {
             uassert(
                 16938, "Skip stage doesn't have a filter (put it on the child)", NULL == matcher);
@@ -353,7 +375,10 @@ public:
             uassert(16933, "Num argument must be provided to skip", nodeArgs["num"].isNumber());
             PlanStage* subNode =
                 parseQuery(txn, collection, nodeArgs["node"].Obj(), workingSet, exprs);
-            return new SkipStage(nodeArgs["num"].numberInt(), workingSet, subNode);
+            uassert(28733,
+                    "Can't parse sub-node of SKIP: " + nodeArgs["node"].Obj().toString(),
+                    NULL != subNode);
+            return new SkipStage(txn, nodeArgs["num"].numberInt(), workingSet, subNode);
         } else if ("cscan" == nodeName) {
             CollectionScanParams params;
             params.collection = collection;
@@ -394,8 +419,7 @@ public:
             params.pattern = nodeArgs["pattern"].Obj();
             // Dedup is true by default.
 
-            unique_ptr<MergeSortStage> mergeStage(
-                new MergeSortStage(params, workingSet, collection));
+            auto mergeStage = make_unique<MergeSortStage>(txn, params, workingSet, collection);
 
             BSONObjIterator it(nodeArgs["nodes"].Obj());
             while (it.more()) {
@@ -436,6 +460,7 @@ public:
             if (!params.query.parse(search,
                                     fam->getSpec().defaultLanguage().str().c_str(),
                                     fts::FTSQuery::caseSensitiveDefault,
+                                    fts::FTSQuery::diacriticSensitiveDefault,
                                     fam->getSpec().getTextIndexVersion()).isOK()) {
                 return NULL;
             }
@@ -449,14 +474,13 @@ public:
             uassert(18638,
                     "isMulti argument must be provided to delete",
                     nodeArgs["isMulti"].type() == Bool);
-            uassert(18639,
-                    "shouldCallLogOp argument must be provided to delete",
-                    nodeArgs["shouldCallLogOp"].type() == Bool);
             PlanStage* subNode =
                 parseQuery(txn, collection, nodeArgs["node"].Obj(), workingSet, exprs);
+            uassert(28734,
+                    "Can't parse sub-node of DELETE: " + nodeArgs["node"].Obj().toString(),
+                    NULL != subNode);
             DeleteStageParams params;
             params.isMulti = nodeArgs["isMulti"].Bool();
-            params.shouldCallLogOp = nodeArgs["shouldCallLogOp"].Bool();
             return new DeleteStage(txn, params, workingSet, collection, subNode);
         } else {
             return NULL;

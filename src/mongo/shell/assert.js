@@ -1,4 +1,4 @@
-doassert = function(msg) {
+doassert = function(msg, obj) {
     // eval if msg is a function
     if (typeof(msg) == "function")
         msg = msg();
@@ -8,7 +8,12 @@ doassert = function(msg) {
     else
         print("assert: " + msg);
 
-    var ex = Error(msg);
+    var ex;
+    if (obj) {
+        ex = _getErrorWithCode(obj, msg);
+    } else {
+        ex = Error(msg);
+    }
     print(ex.stack);
     throw ex;
 }
@@ -251,7 +256,7 @@ assert.commandWorked = function(res, msg){
 
     if (res.ok == 1)
         return res;
-    doassert("command failed: " + tojson(res) + " : " + msg);
+    doassert("command failed: " + tojson(res) + " : " + msg, res);
 }
 
 assert.commandFailed = function(res, msg){
@@ -266,9 +271,10 @@ assert.commandFailedWithCode = function(res, code, msg){
     if (assert._debug && msg) print("in assert for: " + msg);
 
     assert(!res.ok, "Command result indicates success, but expected failure with code " + code +
-          ": " + tojson(res));
+          ": " + tojson(res) + " : " + msg);
     assert.eq(res.code, code, "Expected failure code did not match actual in command result: " +
-              tojson(res));
+              tojson(res) + " : " + msg);
+    return res;
 }
 
 assert.isnull = function(what, msg){
@@ -396,7 +402,7 @@ assert.writeOK = function(res, msg) {
     if (errMsg) {
         if (msg)
             errMsg = errMsg + ": " + msg;
-        doassert(errMsg);
+        doassert(errMsg, res);
     }
     
     return res;
@@ -453,7 +459,7 @@ assert.gleOK = function(res, msg) {
     if (errMsg) {
         if (msg)
             errMsg = errMsg + ": " + msg;
-        doassert(errMsg);
+        doassert(errMsg, res);
     }
     
     return res;
@@ -464,7 +470,7 @@ assert.gleSuccess = function(dbOrGLEDoc, msg) {
     if (gle.err) {
         if (typeof(msg) == "function") 
             msg = msg(gle);
-        doassert("getLastError not null:" + tojson(gle) + " :" + msg);
+        doassert("getLastError not null:" + tojson(gle) + " :" + msg, gle);
     }
     return gle;
 }

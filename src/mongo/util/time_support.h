@@ -47,13 +47,17 @@ using Microseconds = stdx::chrono::microseconds;
 using Milliseconds = stdx::chrono::milliseconds;
 using Seconds = stdx::chrono::seconds;
 using Minutes = stdx::chrono::minutes;
+using Hours = stdx::chrono::hours;
 using stdx::chrono::duration_cast;
 
 void time_t_to_Struct(time_t t, struct tm* buf, bool local = false);
 std::string time_t_to_String_short(time_t t);
 
 //
-// Operators for putting durations to streams.
+// Operators for putting durations to streams. Note that these will
+// *not* normally be found by ADL since the duration types are
+// typedefs, but see the handling of chrono::duration in
+// logstream_builder.h for why they are useful.
 //
 
 std::ostream& operator<<(std::ostream& os, Microseconds us);
@@ -258,6 +262,11 @@ private:
 // uses ISO 8601 dates without trailing Z
 // colonsOk should be false when creating filenames
 std::string terseCurrentTime(bool colonsOk = true);
+
+/**
+ * Produces a short UTC date + time approriate for file names with Z appended.
+ */
+std::string terseUTCCurrentTime();
 
 /**
  * Formats "date" according to the ISO 8601 extended form standard, including date,

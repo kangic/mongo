@@ -34,14 +34,19 @@
 
 #include <string>
 
+#include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/internal_user_auth.h"
 #include "mongo/db/client.h"
+#include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/metadata/audit_metadata.h"
+#include "mongo/rpc/metadata/config_server_response_metadata.h"
 #include "mongo/s/client/scc_fast_query_handler.h"
+#include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_last_error_info.h"
+#include "mongo/s/grid.h"
 #include "mongo/s/version_manager.h"
 #include "mongo/util/log.h"
 
@@ -50,26 +55,26 @@ namespace mongo {
 using std::string;
 
 namespace {
+Status _shardingReplyMetadataReader(const BSONObj& metadataObj, StringData hostString) {
+    saveGLEStats(metadataObj, hostString);
 
-bool initWireVersion(DBClientBase* conn, std::string* errMsg) {
-    BSONObj response;
-    if (!conn->runCommand("admin", BSON("isMaster" << 1), response)) {
-        *errMsg = str::stream() << "Failed to determine wire version "
-                                << "for internal connection: " << response;
-        return false;
+    auto shard = grid.shardRegistry()->getShardNoReload(hostString.toString());
+    if (!shard) {
+        return Status::OK();
     }
-
-    if (response.hasField("minWireVersion") && response.hasField("maxWireVersion")) {
-        int minWireVersion = response["minWireVersion"].numberInt();
-        int maxWireVersion = response["maxWireVersion"].numberInt();
-        conn->setWireVersions(minWireVersion, maxWireVersion);
+    // If this host is a known shard of ours, look for a config server optime in the response
+    // metadata to use to update our notion of the current config server optime.
+    auto responseStatus = rpc::ConfigServerResponseMetadata::readFromMetadata(metadataObj);
+    if (!responseStatus.isOK()) {
+        return responseStatus.getStatus();
     }
-
-    return true;
+    auto opTime = responseStatus.getValue().getOpTime();
+    if (opTime.is_initialized()) {
+        grid.shardRegistry()->advanceConfigOpTime(opTime.get());
+    }
+    return Status::OK();
 }
-
 }  // namespace
-
 
 ShardingConnectionHook::ShardingConnectionHook(bool shardedConnections)
     : _shardedConnections(shardedConnections) {}
@@ -80,40 +85,24 @@ void ShardingConnectionHook::onCreate(DBClientBase* conn) {
     if (getGlobalAuthorizationManager()->isAuthEnabled()) {
         LOG(2) << "calling onCreate auth for " << conn->toString();
 
-        bool result = authenticateInternalUser(conn);
+        bool result = conn->authenticateInternalUser();
 
         uassert(15847,
                 str::stream() << "can't authenticate to server " << conn->getServerAddress(),
                 result);
     }
 
-    // Initialize the wire version of single connections
-    if (conn->type() == ConnectionString::MASTER) {
-        LOG(2) << "checking wire version of new connection " << conn->toString();
-
-        // Initialize the wire protocol version of the connection to find out if we
-        // can send write commands to this connection.
-        string errMsg;
-        if (!initWireVersion(conn, &errMsg)) {
-            uasserted(17363, errMsg);
-        }
-    }
-
     if (_shardedConnections) {
         // For every DBClient created by mongos, add a hook that will capture the response from
         // commands we pass along from the client, so that we can target the correct node when
         // subsequent getLastError calls are made by mongos.
-        conn->setReplyMetadataReader([](const BSONObj& metadataObj, StringData hostString)
-                                         -> Status {
-                                             saveGLEStats(metadataObj, hostString);
-                                             return Status::OK();
-                                         });
+        conn->setReplyMetadataReader(_shardingReplyMetadataReader);
     }
 
     // For every DBClient created by mongos, add a hook that will append impersonated users
     // to the end of every runCommand.  mongod uses this information to produce auditing
     // records attributed to the proper authenticated user(s).
-    conn->setRequestMetadataWriter([](BSONObjBuilder* metadataBob) -> Status {
+    conn->setRequestMetadataWriter([](BSONObjBuilder* metadataBob, StringData) -> Status {
         audit::writeImpersonatedUsersToMetadata(metadataBob);
         return Status::OK();
     });
@@ -125,6 +114,33 @@ void ShardingConnectionHook::onCreate(DBClientBase* conn) {
         if (scc) {
             scc->attachQueryHandler(new SCCFastQueryHandler);
         }
+    } else if (conn->type() == ConnectionString::MASTER) {
+        BSONObj isMasterResponse;
+        if (!conn->runCommand("admin", BSON("ismaster" << 1), isMasterResponse)) {
+            uassertStatusOK(getStatusFromCommandResult(isMasterResponse));
+        }
+
+        long long configServerModeNumber;
+        Status status =
+            bsonExtractIntegerField(isMasterResponse, "configsvr", &configServerModeNumber);
+
+        if (status == ErrorCodes::NoSuchKey) {
+            // This isn't a config server we're talking to.
+            return;
+        }
+
+        uassert(28785,
+                str::stream() << "Unrecognized configsvr version number: " << configServerModeNumber
+                              << ". Expected either 0 or 1",
+                configServerModeNumber == 0 || configServerModeNumber == 1);
+
+        BSONElement setName = isMasterResponse["setName"];
+        status = grid.forwardingCatalogManager()->scheduleReplaceCatalogManagerIfNeeded(
+            configServerModeNumber == 0 ? CatalogManager::ConfigServerMode::SCCC
+                                        : CatalogManager::ConfigServerMode::CSRS,
+            setName.type() == String ? setName.valueStringData() : StringData(),
+            static_cast<DBClientConnection*>(conn)->getServerHostAndPort());
+        uassertStatusOK(status);
     }
 }
 

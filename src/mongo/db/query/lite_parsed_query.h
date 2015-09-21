@@ -32,10 +32,10 @@
 #include <string>
 
 #include "mongo/db/jsobj.h"
+#include "mongo/db/namespace_string.h"
 
 namespace mongo {
 
-class NamespaceString;
 class QueryMessage;
 class Status;
 template <typename T>
@@ -47,6 +47,9 @@ class StatusWith;
  */
 class LiteParsedQuery {
 public:
+    static const char kFindCommandName[];
+    static const char kShardVersionField[];
+
     /**
      * Parses a find command object, 'cmdObj'. Caller must indicate whether or not this lite
      * parsed query is an explained query or not via 'isExplain'.
@@ -54,13 +57,14 @@ public:
      * Returns a heap allocated LiteParsedQuery on success or an error if 'cmdObj' is not well
      * formed.
      */
-    static StatusWith<std::unique_ptr<LiteParsedQuery>> makeFromFindCommand(
-        const NamespaceString& nss, const BSONObj& cmdObj, bool isExplain);
+    static StatusWith<std::unique_ptr<LiteParsedQuery>> makeFromFindCommand(NamespaceString nss,
+                                                                            const BSONObj& cmdObj,
+                                                                            bool isExplain);
 
     /**
      * Constructs a LiteParseQuery object as though it is from a legacy QueryMessage.
      */
-    static StatusWith<std::unique_ptr<LiteParsedQuery>> makeAsOpQuery(const std::string& ns,
+    static StatusWith<std::unique_ptr<LiteParsedQuery>> makeAsOpQuery(NamespaceString nss,
                                                                       int ntoskip,
                                                                       int ntoreturn,
                                                                       int queryoptions,
@@ -76,15 +80,43 @@ public:
     /**
      * Constructs a LiteParseQuery object that can be used to serialize to find command
      * BSON object.
+     *
+     * Input must be fully validated (e.g. if there is a limit value, it must be non-negative).
      */
-    static StatusWith<std::unique_ptr<LiteParsedQuery>> makeAsFindCmd(const NamespaceString& ns,
-                                                                      const BSONObj& query,
-                                                                      boost::optional<int> limit);
+    static std::unique_ptr<LiteParsedQuery> makeAsFindCmd(
+        NamespaceString nss,
+        const BSONObj& filter = BSONObj(),
+        const BSONObj& projection = BSONObj(),
+        const BSONObj& sort = BSONObj(),
+        const BSONObj& hint = BSONObj(),
+        const BSONObj& readConcern = BSONObj(),
+        boost::optional<long long> skip = boost::none,
+        boost::optional<long long> limit = boost::none,
+        boost::optional<long long> batchSize = boost::none,
+        boost::optional<long long> ntoreturn = boost::none,
+        bool wantMore = true,
+        bool isExplain = false,
+        const std::string& comment = "",
+        int maxScan = 0,
+        int maxTimeMS = 0,
+        const BSONObj& min = BSONObj(),
+        const BSONObj& max = BSONObj(),
+        bool returnKey = false,
+        bool showRecordId = false,
+        bool isSnapshot = false,
+        bool hasReadPref = false,
+        bool isTailable = false,
+        bool isSlaveOk = false,
+        bool isOplogReplay = false,
+        bool isNoCursorTimeout = false,
+        bool isAwaitData = false,
+        bool allowPartialResults = false);
 
     /**
      * Converts this LPQ into a find command.
      */
     BSONObj asFindCommand() const;
+    void asFindCommand(BSONObjBuilder* cmdBuilder) const;
 
     /**
      * Helper functions to parse maxTimeMS from a command object.  Returns the contained value,
@@ -105,13 +137,6 @@ public:
     static bool isTextScoreMeta(BSONElement elt);
 
     /**
-     * Helper function to identify recordId projection.
-     *
-     * Example: {a: {$meta: "recordId"}}.
-     */
-    static bool isRecordIdMeta(BSONElement elt);
-
-    /**
      * Helper function to validate a sort object.
      * Returns true if each element satisfies one of:
      * 1. a number with value 1
@@ -126,19 +151,32 @@ public:
      */
     static bool isQueryIsolated(const BSONObj& query);
 
+    // Read preference is attached to commands in "wrapped" form, e.g.
+    //   { $query: { <cmd>: ... } , <kWrappedReadPrefField>: { ... } }
+    //
+    // However, mongos internally "unwraps" the read preference and adds it as a parameter to the
+    // command, e.g.
+    //  { <cmd>: ... , <kUnwrappedReadPrefField>: { <kWrappedReadPrefField>: { ... } } }
+    static const std::string kWrappedReadPrefField;
+    static const std::string kUnwrappedReadPrefField;
+
     // Names of the maxTimeMS command and query option.
     static const std::string cmdOptionMaxTimeMS;
     static const std::string queryOptionMaxTimeMS;
 
     // Names of the $meta projection values.
-    static const std::string metaTextScore;
     static const std::string metaGeoNearDistance;
     static const std::string metaGeoNearPoint;
-    static const std::string metaRecordId;
     static const std::string metaIndexKey;
+    static const std::string metaRecordId;
+    static const std::string metaSortKey;
+    static const std::string metaTextScore;
 
+    const NamespaceString& nss() const {
+        return _nss;
+    }
     const std::string& ns() const {
-        return _ns;
+        return _nss.ns();
     }
 
     const BSONObj& getFilter() const {
@@ -153,25 +191,35 @@ public:
     const BSONObj& getHint() const {
         return _hint;
     }
+    const BSONObj& getReadConcern() const {
+        return _readConcern;
+    }
 
-    static const int kDefaultBatchSize;
+    static const long long kDefaultBatchSize;
 
-    int getSkip() const {
+    boost::optional<long long> getSkip() const {
         return _skip;
     }
-    boost::optional<int> getLimit() const {
+    boost::optional<long long> getLimit() const {
         return _limit;
     }
-    boost::optional<int> getBatchSize() const {
+    boost::optional<long long> getBatchSize() const {
         return _batchSize;
     }
+    boost::optional<long long> getNToReturn() const {
+        return _ntoreturn;
+    }
+
+    /**
+     * Returns batchSize or ntoreturn value if either is set. If neither is set,
+     * returns boost::none.
+     */
+    boost::optional<long long> getEffectiveBatchSize() const;
+
     bool wantMore() const {
         return _wantMore;
     }
 
-    bool isFromFindCommand() const {
-        return _fromCommand;
-    }
     bool isExplain() const {
         return _explain;
     }
@@ -225,8 +273,12 @@ public:
     bool isExhaust() const {
         return _exhaust;
     }
-    bool isPartial() const {
-        return _partial;
+    bool isAllowPartialResults() const {
+        return _allowPartialResults;
+    }
+
+    boost::optional<long long> getReplicationTerm() const {
+        return _replicationTerm;
     }
 
     /**
@@ -246,7 +298,7 @@ public:
         const QueryMessage& qm);
 
 private:
-    LiteParsedQuery() = default;
+    LiteParsedQuery(NamespaceString nss);
 
     /**
      * Parsing code calls this after construction of the LPQ is complete. There are additional
@@ -254,8 +306,7 @@ private:
      */
     Status validate() const;
 
-    Status init(const std::string& ns,
-                int ntoskip,
+    Status init(int ntoskip,
                 int ntoreturn,
                 int queryOptions,
                 const BSONObj& queryObj,
@@ -293,7 +344,7 @@ private:
      */
     Status validateFindCmd();
 
-    std::string _ns;
+    const NamespaceString _nss;
 
     BSONObj _filter;
     BSONObj _proj;
@@ -302,14 +353,28 @@ private:
     // the key pattern hinted.  If the hint was by index name, the value of '_hint' is
     // {$hint: <String>}, where <String> is the index name hinted.
     BSONObj _hint;
+    // The read concern is parsed elsewhere.
+    BSONObj _readConcern;
 
-    int _skip = 0;
     bool _wantMore = true;
 
-    boost::optional<int> _limit;
-    boost::optional<int> _batchSize;
+    // Must be either unset or positive. Negative skip is illegal and a skip of zero received from
+    // the client is interpreted as the absence of a skip value.
+    boost::optional<long long> _skip;
 
-    bool _fromCommand = false;
+    // Must be either unset or positive. Negative limit is illegal and a limit value of zero
+    // received from the client is interpreted as the absence of a limit value.
+    boost::optional<long long> _limit;
+
+    // Must be either unset or non-negative. Negative batchSize is illegal but batchSize of 0 is
+    // allowed.
+    boost::optional<long long> _batchSize;
+
+    // Set only when parsed from an OP_QUERY find message. The value is computed by driver or shell
+    // and is set to be a min of batchSize and limit provided by user. LPQ can have set either
+    // ntoreturn or batchSize / limit.
+    boost::optional<long long> _ntoreturn;
+
     bool _explain = false;
 
     std::string _comment;
@@ -332,7 +397,9 @@ private:
     bool _noCursorTimeout = false;
     bool _awaitData = false;
     bool _exhaust = false;
-    bool _partial = false;
+    bool _allowPartialResults = false;
+
+    boost::optional<long long> _replicationTerm;
 };
 
 }  // namespace mongo

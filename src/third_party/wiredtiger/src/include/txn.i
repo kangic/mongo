@@ -105,33 +105,48 @@ __wt_txn_oldest_id(WT_SESSION_IMPL *session)
 {
 	WT_BTREE *btree;
 	WT_TXN_GLOBAL *txn_global;
-	uint64_t checkpoint_snap_min, oldest_id;
+	uint64_t checkpoint_gen, checkpoint_pinned, oldest_id;
 
 	txn_global = &S2C(session)->txn_global;
 	btree = S2BT_SAFE(session);
 
 	/*
-	 * Take a local copy of ID in case they are updated while we are
-	 * checking visibility.
+	 * Take a local copy of these IDs in case they are updated while we are
+	 * checking visibility.  Only the generation needs to be carefully
+	 * ordered: if a checkpoint is starting and the generation is bumped,
+	 * we take the minimum of the other two IDs, which is what we want.
 	 */
-	checkpoint_snap_min = txn_global->checkpoint_snap_min;
 	oldest_id = txn_global->oldest_id;
+	WT_ORDERED_READ(checkpoint_gen, txn_global->checkpoint_gen);
+	checkpoint_pinned = txn_global->checkpoint_pinned;
 
 	/*
-	 * If there is no active checkpoint or this handle is up to date with
-	 * the active checkpoint it's safe to ignore the checkpoint ID in the
-	 * visibility check.
+	 * Checkpoint transactions often fall behind ordinary application
+	 * threads.  Take special effort to not keep changes pinned in cache
+	 * if they are only required for the checkpoint and it has already
+	 * seen them.
+	 *
+	 * If there is no active checkpoint, this session is doing the
+	 * checkpoint, or this handle is up to date with the active checkpoint
+	 * then it's safe to ignore the checkpoint ID in the visibility check.
 	 */
-	if (checkpoint_snap_min != WT_TXN_NONE && (btree == NULL ||
-	    btree->checkpoint_gen != txn_global->checkpoint_gen) &&
-	    WT_TXNID_LT(checkpoint_snap_min, oldest_id))
-		/*
-		 * Use the checkpoint ID for the visibility check if it is the
-		 * oldest ID in the system.
-		 */
-		oldest_id = checkpoint_snap_min;
+	if (checkpoint_pinned == WT_TXN_NONE ||
+	    WT_TXNID_LT(oldest_id, checkpoint_pinned) ||
+	    WT_SESSION_IS_CHECKPOINT(session) ||
+	    (btree != NULL && btree->checkpoint_gen == checkpoint_gen))
+		return (oldest_id);
 
-	return (oldest_id);
+	return (checkpoint_pinned);
+}
+
+/*
+ * __wt_txn_committed --
+ *	Return if a transaction has been committed.
+ */
+static inline bool
+__wt_txn_committed(WT_SESSION_IMPL *session, uint64_t id)
+{
+	return (WT_TXNID_LT(id, S2C(session)->txn_global.last_running));
 }
 
 /*
@@ -140,7 +155,7 @@ __wt_txn_oldest_id(WT_SESSION_IMPL *session)
  *	all sessions in the system will see the transaction ID including the
  *	ID that belongs to a running checkpoint.
  */
-static inline int
+static inline bool
 __wt_txn_visible_all(WT_SESSION_IMPL *session, uint64_t id)
 {
 	uint64_t oldest_id;
@@ -154,27 +169,21 @@ __wt_txn_visible_all(WT_SESSION_IMPL *session, uint64_t id)
  * __wt_txn_visible --
  *	Can the current transaction see the given ID?
  */
-static inline int
+static inline bool
 __wt_txn_visible(WT_SESSION_IMPL *session, uint64_t id)
 {
 	WT_TXN *txn;
+	bool found;
 
 	txn = &session->txn;
 
 	/* Changes with no associated transaction are always visible. */
 	if (id == WT_TXN_NONE)
-		return (1);
+		return (true);
 
 	/* Nobody sees the results of aborted transactions. */
 	if (id == WT_TXN_ABORTED)
-		return (0);
-
-	/*
-	 * Eviction only sees globally visible updates, or if there is a
-	 * checkpoint transaction running, use its transaction.
-	 */
-	if (txn->isolation == WT_ISO_EVICTION)
-		return (__wt_txn_visible_all(session, id));
+		return (false);
 
 	/*
 	 * Read-uncommitted transactions see all other changes.
@@ -188,11 +197,11 @@ __wt_txn_visible(WT_SESSION_IMPL *session, uint64_t id)
 	 */
 	if (txn->isolation == WT_ISO_READ_UNCOMMITTED ||
 	    session->dhandle == session->meta_dhandle)
-		return (1);
+		return (true);
 
 	/* Transactions see their own changes. */
 	if (id == txn->id)
-		return (1);
+		return (true);
 
 	/*
 	 * WT_ISO_SNAPSHOT, WT_ISO_READ_COMMITTED: the ID is visible if it is
@@ -204,12 +213,12 @@ __wt_txn_visible(WT_SESSION_IMPL *session, uint64_t id)
 	 * snapshot is empty.
 	 */
 	if (WT_TXNID_LE(txn->snap_max, id))
-		return (0);
+		return (false);
 	if (txn->snapshot_count == 0 || WT_TXNID_LT(id, txn->snap_min))
-		return (1);
+		return (true);
 
-	return (bsearch(&id, txn->snapshot, txn->snapshot_count,
-	    sizeof(uint64_t), __wt_txnid_cmp) == NULL);
+	WT_BINARY_SEARCH(id, txn->snapshot, txn->snapshot_count, found);
+	return (!found);
 }
 
 /*
@@ -254,13 +263,13 @@ __wt_txn_begin(WT_SESSION_IMPL *session, const char *cfg[])
 		 * We're about to allocate a snapshot: if we need to block for
 		 * eviction, it's better to do it beforehand.
 		 */
-		WT_RET(__wt_cache_full_check(session));
+		WT_RET(__wt_cache_eviction_check(session, 0, NULL));
 
 		__wt_txn_get_snapshot(session);
 	}
 
 	F_SET(txn, WT_TXN_RUNNING);
-	return (0);
+	return (false);
 }
 
 /*
@@ -294,7 +303,7 @@ __wt_txn_new_id(WT_SESSION_IMPL *session)
 	 * global current ID, so we want post-increment semantics.  Our atomic
 	 * add primitive does pre-increment, so adjust the result here.
 	 */
-	return (WT_ATOMIC_ADD8(S2C(session)->txn_global.current, 1) - 1);
+	return (__wt_atomic_addv64(&S2C(session)->txn_global.current, 1) - 1);
 }
 
 /*
@@ -310,7 +319,7 @@ __wt_txn_idle_cache_check(WT_SESSION_IMPL *session)
 	WT_TXN_STATE *txn_state;
 
 	txn = &session->txn;
-	txn_state = &S2C(session)->txn_global.states[session->id];
+	txn_state = WT_SESSION_TXN_STATE(session);
 
 	/*
 	 * Check the published snap_min because read-uncommitted never sets
@@ -318,7 +327,7 @@ __wt_txn_idle_cache_check(WT_SESSION_IMPL *session)
 	 */
 	if (F_ISSET(txn, WT_TXN_RUNNING) &&
 	    !F_ISSET(txn, WT_TXN_HAS_ID) && txn_state->snap_min == WT_TXN_NONE)
-		WT_RET(__wt_cache_full_check(session));
+		WT_RET(__wt_cache_eviction_check(session, 0, NULL));
 
 	return (0);
 }
@@ -346,7 +355,7 @@ __wt_txn_id_check(WT_SESSION_IMPL *session)
 	if (!F_ISSET(txn, WT_TXN_HAS_ID)) {
 		conn = S2C(session);
 		txn_global = &conn->txn_global;
-		txn_state = &txn_global->states[session->id];
+		txn_state = WT_SESSION_TXN_STATE(session);
 
 		WT_ASSERT(session, txn_state->id == WT_TXN_NONE);
 
@@ -370,8 +379,9 @@ __wt_txn_id_check(WT_SESSION_IMPL *session)
 		 */
 		do {
 			txn_state->id = txn->id = txn_global->current;
-		} while (!WT_ATOMIC_CAS8(
-		    txn_global->current, txn->id, txn->id + 1));
+		} while (!__wt_atomic_casv64(
+		    &txn_global->current, txn->id, txn->id + 1) ||
+		    WT_TXNID_LT(txn->id, txn_global->last_running));
 
 		/*
 		 * If we have used 64-bits of transaction IDs, there is nothing
@@ -438,7 +448,7 @@ __wt_txn_cursor_op(WT_SESSION_IMPL *session)
 
 	txn = &session->txn;
 	txn_global = &S2C(session)->txn_global;
-	txn_state = &txn_global->states[session->id];
+	txn_state = WT_SESSION_TXN_STATE(session);
 
 	/*
 	 * If there is no transaction running (so we don't have an ID), and no
@@ -470,7 +480,7 @@ __wt_txn_cursor_op(WT_SESSION_IMPL *session)
  * __wt_txn_am_oldest --
  *	Am I the oldest transaction in the system?
  */
-static inline int
+static inline bool
 __wt_txn_am_oldest(WT_SESSION_IMPL *session)
 {
 	WT_CONNECTION_IMPL *conn;
@@ -485,12 +495,12 @@ __wt_txn_am_oldest(WT_SESSION_IMPL *session)
 	txn_global = &conn->txn_global;
 
 	if (txn->id == WT_TXN_NONE)
-		return (0);
+		return (false);
 
 	WT_ORDERED_READ(session_cnt, conn->session_cnt);
 	for (i = 0, s = txn_global->states; i < session_cnt; i++, s++)
 		if ((id = s->id) != WT_TXN_NONE && WT_TXNID_LT(id, txn->id))
-			return (0);
+			return (false);
 
-	return (1);
+	return (true);
 }

@@ -55,7 +55,7 @@ var dropAction = [
     {dropIndexes: collection, index: "i_1"},
     {drop: collection},
     {dropDatabase: 1 },
-    {convertToCapped: collection, size: 20000}
+    // {convertToCapped: collection, size: 20000} // Re-enable for SERVER-19910 after WT-2042.
 ];
 
 
@@ -87,7 +87,7 @@ for (var idx = 0; idx < dropAction.length; idx++) {
     assert.commandWorked(masterDB.runCommand( dc ));
     
     jsTest.log("Waiting on replication");
-    replTest.awaitReplication();
+    replTest.awaitReplication(60*1000);
 
     // we need to assert.soon because the drop only marks the index for removal
     // the removal itself is asynchronous and may take another moment before it happens

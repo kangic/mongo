@@ -44,18 +44,13 @@
 
 namespace mongo {
 
-using std::cout;
-using std::endl;
-
 bool is32bit() {
     return (sizeof(int*) == 4);
 }
 
 void logProcessDetails() {
-    log() << mongodVersion() << endl;
-    printGitVersion();
-    printOpenSSLVersion();
-    printAllocator();
+    log() << mongodVersion();
+    printBuildInfo();
     printCommandLineOpts();
 }
 

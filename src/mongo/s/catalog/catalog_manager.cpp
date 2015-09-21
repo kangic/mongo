@@ -26,14 +26,13 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/s/catalog/catalog_manager.h"
 
-#include <memory>
-
 #include "mongo/base/status.h"
-#include "mongo/base/status_with.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
@@ -44,8 +43,9 @@
 
 namespace mongo {
 
-using std::unique_ptr;
 using std::string;
+using std::unique_ptr;
+using std::vector;
 
 namespace {
 
@@ -74,14 +74,15 @@ Status getStatus(const BatchedCommandResponse& response) {
 
 }  // namespace
 
-Status CatalogManager::insert(const string& ns,
+Status CatalogManager::insert(OperationContext* txn,
+                              const string& ns,
                               const BSONObj& doc,
                               BatchedCommandResponse* response) {
     unique_ptr<BatchedInsertRequest> insert(new BatchedInsertRequest());
     insert->addToDocuments(doc);
 
     BatchedCommandRequest request(insert.release());
-    request.setNS(ns);
+    request.setNS(NamespaceString(ns));
     request.setWriteConcern(WriteConcernOptions::Majority);
 
     BatchedCommandResponse dummyResponse;
@@ -93,11 +94,12 @@ Status CatalogManager::insert(const string& ns,
     unique_ptr<BatchedCommandRequest> requestWithIds(BatchedCommandRequest::cloneWithIds(request));
     const BatchedCommandRequest& requestToSend = requestWithIds.get() ? *requestWithIds : request;
 
-    writeConfigServerDirect(requestToSend, response);
+    writeConfigServerDirect(txn, requestToSend, response);
     return getStatus(*response);
 }
 
-Status CatalogManager::update(const string& ns,
+Status CatalogManager::update(OperationContext* txn,
+                              const string& ns,
                               const BSONObj& query,
                               const BSONObj& update,
                               bool upsert,
@@ -114,18 +116,19 @@ Status CatalogManager::update(const string& ns,
     updateRequest->setWriteConcern(WriteConcernOptions::Majority);
 
     BatchedCommandRequest request(updateRequest.release());
-    request.setNS(ns);
+    request.setNS(NamespaceString(ns));
 
     BatchedCommandResponse dummyResponse;
     if (response == NULL) {
         response = &dummyResponse;
     }
 
-    writeConfigServerDirect(request, response);
+    writeConfigServerDirect(txn, request, response);
     return getStatus(*response);
 }
 
-Status CatalogManager::remove(const string& ns,
+Status CatalogManager::remove(OperationContext* txn,
+                              const string& ns,
                               const BSONObj& query,
                               int limit,
                               BatchedCommandResponse* response) {
@@ -138,14 +141,14 @@ Status CatalogManager::remove(const string& ns,
     deleteRequest->setWriteConcern(WriteConcernOptions::Majority);
 
     BatchedCommandRequest request(deleteRequest.release());
-    request.setNS(ns);
+    request.setNS(NamespaceString(ns));
 
     BatchedCommandResponse dummyResponse;
     if (response == NULL) {
         response = &dummyResponse;
     }
 
-    writeConfigServerDirect(request, response);
+    writeConfigServerDirect(txn, request, response);
     return getStatus(*response);
 }
 

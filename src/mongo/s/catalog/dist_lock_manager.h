@@ -70,7 +70,6 @@ public:
         MONGO_DISALLOW_COPYING(ScopedDistLock);
 
     public:
-        ScopedDistLock();  // TODO: SERVER-18007
         ScopedDistLock(DistLockHandle lockHandle, DistLockManager* lockManager);
         ~ScopedDistLock();
 
@@ -89,8 +88,18 @@ public:
 
     virtual ~DistLockManager() = default;
 
+    /**
+     * Performs bootstrapping for the manager. Implementation do not need to guarantee
+     * thread safety so callers should employ proper synchronization when calling this method.
+     */
     virtual void startUp() = 0;
-    virtual void shutDown() = 0;
+
+    /**
+     * Cleanup the manager's resources. Pass false to allowNetworking in order to do work that
+     * involves sending network messages. Implementation do not need to guarantee thread safety
+     * so callers should employ proper synchronization when calling this method.
+     */
+    virtual void shutDown(bool allowNetworking) = 0;
 
     /**
      * Tries multiple times to lock, using the specified lock try interval, until

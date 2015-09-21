@@ -31,8 +31,11 @@
 #include "mongo/db/db_raii.h"
 
 #include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/database.h"
 #include "mongo/db/client.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/stats/top.h"
 #include "mongo/s/d_state.h"
 
@@ -40,6 +43,13 @@ namespace mongo {
 
 AutoGetDb::AutoGetDb(OperationContext* txn, StringData ns, LockMode mode)
     : _dbLock(txn->lockState(), ns, mode), _db(dbHolder().get(txn, ns)) {}
+
+AutoGetCollection::AutoGetCollection(OperationContext* txn,
+                                     const NamespaceString& nss,
+                                     LockMode mode)
+    : _autoDb(txn, nss.db(), mode),
+      _collLock(txn->lockState(), nss.ns(), mode),
+      _coll(_autoDb.getDb() ? _autoDb.getDb()->getCollection(nss) : nullptr) {}
 
 AutoGetOrCreateDb::AutoGetOrCreateDb(OperationContext* txn, StringData ns, LockMode mode)
     : _transaction(txn, MODE_IX),
@@ -58,45 +68,34 @@ AutoGetOrCreateDb::AutoGetOrCreateDb(OperationContext* txn, StringData ns, LockM
 }
 
 AutoGetCollectionForRead::AutoGetCollectionForRead(OperationContext* txn, const std::string& ns)
-    : _txn(txn),
-      _transaction(txn, MODE_IS),
-      _db(_txn, nsToDatabaseSubstring(ns), MODE_IS),
-      _collLock(_txn->lockState(), ns, MODE_IS),
-      _coll(NULL) {
-    _init(ns, nsToCollectionSubstring(ns));
-}
+    : AutoGetCollectionForRead(txn, NamespaceString(ns)) {}
 
 AutoGetCollectionForRead::AutoGetCollectionForRead(OperationContext* txn,
                                                    const NamespaceString& nss)
-    : _txn(txn),
-      _transaction(txn, MODE_IS),
-      _db(_txn, nss.db(), MODE_IS),
-      _collLock(_txn->lockState(), nss.toString(), MODE_IS),
-      _coll(NULL) {
-    _init(nss.toString(), nss.coll());
-}
+    : _txn(txn), _transaction(txn, MODE_IS) {
+    {
+        _autoColl.emplace(txn, nss, MODE_IS);
+        auto curOp = CurOp::get(_txn);
+        stdx::lock_guard<Client> lk(*_txn->getClient());
 
-void AutoGetCollectionForRead::_init(const std::string& ns, StringData coll) {
-    massert(28535, "need a non-empty collection name", !coll.empty());
-
-    // We have both the DB and collection locked, which the prerequisite to do a stable shard
-    // version check.
-    ensureShardVersionOKOrThrow(_txn->getClient(), ns);
-
-    auto curOp = CurOp::get(_txn);
-    stdx::lock_guard<Client> lk(*_txn->getClient());
-    // TODO: OldClientContext legacy, needs to be removed
-    curOp->ensureStarted();
-    curOp->setNS_inlock(ns);
-
-    // At this point, we are locked in shared mode for the database by the DB lock in the
-    // constructor, so it is safe to load the DB pointer.
-    if (_db.getDb()) {
         // TODO: OldClientContext legacy, needs to be removed
-        curOp->enter_inlock(ns.c_str(), _db.getDb()->getProfilingLevel());
+        curOp->ensureStarted();
+        curOp->setNS_inlock(nss.ns());
 
-        _coll = _db.getDb()->getCollection(ns);
+        // At this point, we are locked in shared mode for the database by the DB lock in the
+        // constructor, so it is safe to load the DB pointer.
+        if (_autoColl->getDb()) {
+            // TODO: OldClientContext legacy, needs to be removed
+            curOp->enter_inlock(nss.ns().c_str(), _autoColl->getDb()->getProfilingLevel());
+        }
     }
+
+    // Note: this can yield.
+    _ensureMajorityCommittedSnapshotIsValid(nss);
+
+    // We have both the DB and collection locked, which is the prerequisite to do a stable shard
+    // version check, but we'd like to do the check after we have a satisfactory snapshot.
+    ensureShardVersionOKOrThrow(_txn, nss.ns());
 }
 
 AutoGetCollectionForRead::~AutoGetCollectionForRead() {
@@ -110,6 +109,38 @@ AutoGetCollectionForRead::~AutoGetCollectionForRead() {
                 currentOp->isCommand());
 }
 
+void AutoGetCollectionForRead::_ensureMajorityCommittedSnapshotIsValid(const NamespaceString& nss) {
+    while (true) {
+        auto coll = _autoColl->getCollection();
+        if (!coll) {
+            return;
+        }
+        auto minSnapshot = coll->getMinimumVisibleSnapshot();
+        if (!minSnapshot) {
+            return;
+        }
+        auto mySnapshot = _txn->recoveryUnit()->getMajorityCommittedSnapshot();
+        if (!mySnapshot) {
+            return;
+        }
+        if (mySnapshot >= minSnapshot) {
+            return;
+        }
+
+        // Yield locks.
+        _autoColl = {};
+
+        repl::ReplicationCoordinator::get(_txn)->waitForNewSnapshot(_txn);
+
+        uassertStatusOK(_txn->recoveryUnit()->setReadFromMajorityCommittedSnapshot());
+
+        stdx::lock_guard<Client> lk(*_txn->getClient());
+        CurOp::get(_txn)->yielded();
+
+        // Relock.
+        _autoColl.emplace(_txn, nss, MODE_IS);
+    }
+}
 
 OldClientContext::OldClientContext(OperationContext* txn, const std::string& ns, Database* db)
     : _justCreated(false), _doVersion(true), _ns(ns), _db(db), _txn(txn) {}
@@ -158,7 +189,7 @@ void OldClientContext::_checkNotStale() const {
         case dbDelete:   // here as well.
             break;
         default:
-            ensureShardVersionOKOrThrow(_txn->getClient(), _ns);
+            ensureShardVersionOKOrThrow(_txn, _ns);
     }
 }
 

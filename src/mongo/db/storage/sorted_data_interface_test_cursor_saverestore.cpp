@@ -74,8 +74,8 @@ TEST(SortedDataInterface, SaveAndRestorePositionWhileIterateCursor) {
             ASSERT_LT(i, nToInsert);
             ASSERT_EQ(entry, IndexKeyEntry(BSON("" << i), RecordId(42, i * 2)));
 
-            cursor->savePositioned();
-            cursor->restore(opCtx.get());
+            cursor->save();
+            cursor->restore();
         }
         ASSERT(!cursor->next());
         ASSERT_EQ(i, nToInsert);
@@ -120,8 +120,8 @@ TEST(SortedDataInterface, SaveAndRestorePositionWhileIterateCursorReversed) {
             ASSERT_GTE(i, 0);
             ASSERT_EQ(entry, IndexKeyEntry(BSON("" << i), RecordId(42, i * 2)));
 
-            cursor->savePositioned();
-            cursor->restore(opCtx.get());
+            cursor->save();
+            cursor->restore();
         }
         ASSERT(!cursor->next());
         ASSERT_EQ(i, -1);
@@ -165,8 +165,8 @@ TEST(SortedDataInterface, SaveAndRestorePositionWhileIterateCursorWithDupKeys) {
             ASSERT_LT(i, nToInsert);
             ASSERT_EQ(entry, IndexKeyEntry(key1, RecordId(42, i * 2)));
 
-            cursor->savePositioned();
-            cursor->restore(opCtx.get());
+            cursor->save();
+            cursor->restore();
         }
         ASSERT(!cursor->next());
         ASSERT_EQ(i, nToInsert);
@@ -211,8 +211,8 @@ TEST(SortedDataInterface, SaveAndRestorePositionWhileIterateCursorWithDupKeysRev
             ASSERT_GTE(i, 0);
             ASSERT_EQ(entry, IndexKeyEntry(key1, RecordId(42, i * 2)));
 
-            cursor->savePositioned();
-            cursor->restore(opCtx.get());
+            cursor->save();
+            cursor->restore();
         }
         ASSERT(!cursor->next());
         ASSERT_EQ(i, -1);
@@ -247,7 +247,7 @@ TEST(SortedDataInterface, SavePositionWithoutRestore) {
     {
         const std::unique_ptr<OperationContext> opCtx(harnessHelper->newOperationContext());
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(sorted->newCursor(opCtx.get()));
-        cursor->savePositioned();
+        cursor->save();
     }
 }
 
@@ -280,7 +280,7 @@ TEST(SortedDataInterface, SavePositionWithoutRestoreReversed) {
         const std::unique_ptr<OperationContext> opCtx(harnessHelper->newOperationContext());
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(
             sorted->newCursor(opCtx.get(), false));
-        cursor->savePositioned();
+        cursor->save();
     }
 }
 
@@ -299,9 +299,9 @@ void testSaveAndRestorePositionSeesNewInserts(bool forward, bool unique) {
 
     ASSERT_EQ(cursor->seek(seekPoint, true), IndexKeyEntry(seekPoint, loc1));
 
-    cursor->savePositioned();
+    cursor->save();
     insertToIndex(opCtx, sorted, {{key2, loc1}});
-    cursor->restore(opCtx.get());
+    cursor->restore();
 
     ASSERT_EQ(cursor->next(), IndexKeyEntry(key2, loc1));
 }
@@ -333,14 +333,14 @@ void testSaveAndRestorePositionSeesNewInsertsAfterRemove(bool forward, bool uniq
 
     ASSERT_EQ(cursor->seek(seekPoint, true), IndexKeyEntry(seekPoint, loc1));
 
-    cursor->savePositioned();
+    cursor->save();
     removeFromIndex(opCtx, sorted, {{key1, loc1}});
-    cursor->restore(opCtx.get());
+    cursor->restore();
     // The restore may have seeked since it can't return to the saved position.
 
-    cursor->savePositioned();  // Should still save originally saved key as "current position".
+    cursor->save();  // Should still save originally saved key as "current position".
     insertToIndex(opCtx, sorted, {{key2, loc1}});
-    cursor->restore(opCtx.get());
+    cursor->restore();
 
     ASSERT_EQ(cursor->next(), IndexKeyEntry(key2, loc1));
 }
@@ -373,15 +373,15 @@ void testSaveAndRestorePositionSeesNewInsertsAfterEOF(bool forward, bool unique)
     ASSERT_EQ(cursor->seek(key1, true), IndexKeyEntry(key1, loc1));
     // next() would return EOF now.
 
-    cursor->savePositioned();
+    cursor->save();
     removeFromIndex(opCtx, sorted, {{key1, loc1}});
-    cursor->restore(opCtx.get());
+    cursor->restore();
     // The restore may have seeked to EOF.
 
     auto insertPoint = forward ? key2 : key0;
-    cursor->savePositioned();  // Should still save key1 as "current position".
+    cursor->save();  // Should still save key1 as "current position".
     insertToIndex(opCtx, sorted, {{insertPoint, loc1}});
-    cursor->restore(opCtx.get());
+    cursor->restore();
 
     ASSERT_EQ(cursor->next(), IndexKeyEntry(insertPoint, loc1));
 }
@@ -412,27 +412,27 @@ void testSaveAndRestorePositionConsidersRecordId_Forward(bool unique) {
 
     ASSERT_EQ(cursor->seek(key1, true), IndexKeyEntry(key1, loc1));
 
-    cursor->savePositioned();
+    cursor->save();
     removeFromIndex(opCtx, sorted, {{key1, loc1}});
     insertToIndex(opCtx, sorted, {{key1, loc2}});
-    cursor->restore(opCtx.get());  // Lands on inserted key.
+    cursor->restore();  // Lands on inserted key.
 
     ASSERT_EQ(cursor->next(), IndexKeyEntry(key1, loc2));
 
-    cursor->savePositioned();
+    cursor->save();
     removeFromIndex(opCtx, sorted, {{key1, loc2}});
     insertToIndex(opCtx, sorted, {{key1, loc1}});
-    cursor->restore(opCtx.get());  // Lands after inserted.
+    cursor->restore();  // Lands after inserted.
 
     ASSERT_EQ(cursor->next(), IndexKeyEntry(key2, loc1));
 
-    cursor->savePositioned();
+    cursor->save();
     removeFromIndex(opCtx, sorted, {{key2, loc1}});
-    cursor->restore(opCtx.get());
+    cursor->restore();
 
-    cursor->savePositioned();
+    cursor->save();
     insertToIndex(opCtx, sorted, {{key2, loc1}});
-    cursor->restore(opCtx.get());  // Lands at same point as initial save.
+    cursor->restore();  // Lands at same point as initial save.
 
     // Advances from restore point since restore didn't move position.
     ASSERT_EQ(cursor->next(), IndexKeyEntry(key3, loc1));
@@ -457,27 +457,27 @@ void testSaveAndRestorePositionConsidersRecordId_Reverse(bool unique) {
 
     ASSERT_EQ(cursor->seek(key2, true), IndexKeyEntry(key2, loc2));
 
-    cursor->savePositioned();
+    cursor->save();
     removeFromIndex(opCtx, sorted, {{key2, loc2}});
     insertToIndex(opCtx, sorted, {{key2, loc1}});
-    cursor->restore(opCtx.get());
+    cursor->restore();
 
     ASSERT_EQ(cursor->next(), IndexKeyEntry(key2, loc1));
 
-    cursor->savePositioned();
+    cursor->save();
     removeFromIndex(opCtx, sorted, {{key2, loc1}});
     insertToIndex(opCtx, sorted, {{key2, loc2}});
-    cursor->restore(opCtx.get());
+    cursor->restore();
 
     ASSERT_EQ(cursor->next(), IndexKeyEntry(key1, loc1));
 
-    cursor->savePositioned();
+    cursor->save();
     removeFromIndex(opCtx, sorted, {{key1, loc1}});
-    cursor->restore(opCtx.get());
+    cursor->restore();
 
-    cursor->savePositioned();
+    cursor->save();
     insertToIndex(opCtx, sorted, {{key1, loc1}});
-    cursor->restore(opCtx.get());  // Lands at same point as initial save.
+    cursor->restore();  // Lands at same point as initial save.
 
     // Advances from restore point since restore didn't move position.
     ASSERT_EQ(cursor->next(), IndexKeyEntry(key0, loc1));
@@ -504,12 +504,12 @@ TEST(SortedDataInterface, SaveUnpositionedAndRestore) {
 
     cursor->saveUnpositioned();
     removeFromIndex(opCtx, sorted, {{key2, loc1}});
-    cursor->restore(opCtx.get());
+    cursor->restore();
 
     ASSERT_EQ(cursor->seek(key1, true), IndexKeyEntry(key1, loc1));
 
     cursor->saveUnpositioned();
-    cursor->restore(opCtx.get());
+    cursor->restore();
 
     ASSERT_EQ(cursor->seek(key3, true), IndexKeyEntry(key3, loc1));
 }

@@ -42,6 +42,8 @@
 namespace mongo {
 namespace repl {
 
+using executor::RemoteCommandRequest;
+
 VoteRequester::Algorithm::Algorithm(const ReplicaSetConfig& rsConfig,
                                     long long candidateId,
                                     long long term,
@@ -73,7 +75,7 @@ std::vector<RemoteCommandRequest> VoteRequester::Algorithm::getRequests() const 
 
     BSONObjBuilder lastCommittedOp(requestVotesCmdBuilder.subobjStart("lastCommittedOp"));
     lastCommittedOp.append("ts", _lastOplogEntry.getTimestamp());
-    lastCommittedOp.append("term", _lastOplogEntry.getTerm());
+    lastCommittedOp.append("t", _lastOplogEntry.getTerm());
     lastCommittedOp.done();
 
     const BSONObj requestVotesCmd = requestVotesCmdBuilder.obj();
@@ -81,10 +83,7 @@ std::vector<RemoteCommandRequest> VoteRequester::Algorithm::getRequests() const 
     std::vector<RemoteCommandRequest> requests;
     for (const auto& target : _targets) {
         requests.push_back(RemoteCommandRequest(
-            target,
-            "admin",
-            requestVotesCmd,
-            Milliseconds(30 * 1000)));  // trying to match current Socket timeout
+            target, "admin", requestVotesCmd, _rsConfig.getElectionTimeoutPeriod()));
     }
 
     return requests;
@@ -97,6 +96,7 @@ void VoteRequester::Algorithm::processResponse(const RemoteCommandRequest& reque
         log() << "VoteRequester: Got failed response from " << request.target << ": "
               << response.getStatus();
     } else {
+        _responders.insert(request.target);
         ReplSetRequestVotesResponse voteResponse;
         voteResponse.initialize(response.getValue().data);
         if (voteResponse.getVoteGranted()) {
@@ -127,6 +127,10 @@ VoteRequester::VoteRequestResult VoteRequester::Algorithm::getResult() const {
     }
 }
 
+unordered_set<HostAndPort> VoteRequester::Algorithm::getResponders() const {
+    return _responders;
+}
+
 VoteRequester::VoteRequester() : _isCanceled(false) {}
 VoteRequester::~VoteRequester() {}
 
@@ -150,6 +154,10 @@ void VoteRequester::cancel(ReplicationExecutor* executor) {
 
 VoteRequester::VoteRequestResult VoteRequester::getResult() const {
     return _algorithm->getResult();
+}
+
+unordered_set<HostAndPort> VoteRequester::getResponders() const {
+    return _algorithm->getResponders();
 }
 
 }  // namespace repl

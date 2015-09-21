@@ -41,16 +41,19 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/queued_data_stage.h"
 #include "mongo/db/exec/working_set.h"
-#include "mongo/db/query/cursor_responses.h"
-#include "mongo/db/query/find_constants.h"
+#include "mongo/db/query/cursor_response.h"
+#include "mongo/db/query/find_common.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/storage_engine.h"
+#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
 using std::string;
 using std::stringstream;
+using std::unique_ptr;
 using std::vector;
+using stdx::make_unique;
 
 /**
  * Lists the indexes for a given collection.
@@ -143,8 +146,8 @@ public:
         }
         MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "listIndexes", ns.ns());
 
-        std::unique_ptr<WorkingSet> ws(new WorkingSet());
-        std::unique_ptr<QueuedDataStage> root(new QueuedDataStage(ws.get()));
+        auto ws = make_unique<WorkingSet>();
+        auto root = make_unique<QueuedDataStage>(txn, ws.get());
 
         for (size_t i = 0; i < indexNames.size(); i++) {
             BSONObj indexSpec;
@@ -153,35 +156,31 @@ public:
             }
             MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "listIndexes", ns.ns());
 
-            WorkingSetMember member;
-            member.state = WorkingSetMember::OWNED_OBJ;
-            member.keyData.clear();
-            member.loc = RecordId();
-            member.obj = Snapshotted<BSONObj>(SnapshotId(), indexSpec.getOwned());
-            root->pushBack(member);
+            WorkingSetID id = ws->allocate();
+            WorkingSetMember* member = ws->get(id);
+            member->keyData.clear();
+            member->loc = RecordId();
+            member->obj = Snapshotted<BSONObj>(SnapshotId(), indexSpec.getOwned());
+            member->transitionToOwnedObj();
+            root->pushBack(id);
         }
 
         std::string cursorNamespace = str::stream() << dbname << ".$cmd." << name << "."
                                                     << ns.coll();
         dassert(NamespaceString(cursorNamespace).isValid());
-        dassert(NamespaceString(cursorNamespace).isListIndexesGetMore());
-        dassert(ns == NamespaceString(cursorNamespace).getTargetNSForListIndexesGetMore());
+        dassert(NamespaceString(cursorNamespace).isListIndexesCursorNS());
+        dassert(ns == NamespaceString(cursorNamespace).getTargetNSForListIndexes());
 
-        PlanExecutor* rawExec;
-        Status makeStatus = PlanExecutor::make(txn,
-                                               ws.release(),
-                                               root.release(),
-                                               cursorNamespace,
-                                               PlanExecutor::YIELD_MANUAL,
-                                               &rawExec);
-        std::unique_ptr<PlanExecutor> exec(rawExec);
-        if (!makeStatus.isOK()) {
-            return appendCommandStatus(result, makeStatus);
+        auto statusWithPlanExecutor = PlanExecutor::make(
+            txn, std::move(ws), std::move(root), cursorNamespace, PlanExecutor::YIELD_MANUAL);
+        if (!statusWithPlanExecutor.isOK()) {
+            return appendCommandStatus(result, statusWithPlanExecutor.getStatus());
         }
+        unique_ptr<PlanExecutor> exec = std::move(statusWithPlanExecutor.getValue());
 
         BSONArrayBuilder firstBatch;
 
-        const int byteLimit = MaxBytesToReturnToClientAtOnce;
+        const int byteLimit = FindCommon::kMaxBytesToReturnToClientAtOnce;
         for (long long objCount = 0; objCount < batchSize && firstBatch.len() < byteLimit;
              objCount++) {
             BSONObj next;
@@ -196,8 +195,12 @@ public:
         CursorId cursorId = 0LL;
         if (!exec->isEOF()) {
             exec->saveState();
-            ClientCursor* cursor = new ClientCursor(
-                CursorManager::getGlobalCursorManager(), exec.release(), cursorNamespace);
+            exec->detachFromOperationContext();
+            ClientCursor* cursor =
+                new ClientCursor(CursorManager::getGlobalCursorManager(),
+                                 exec.release(),
+                                 cursorNamespace,
+                                 txn->recoveryUnit()->isReadingFromMajorityCommittedSnapshot());
             cursorId = cursor->cursorid();
         }
 

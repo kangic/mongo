@@ -42,7 +42,6 @@ const std::string kConfigVersionFieldName = "configVersion";
 const std::string kDryRunFieldName = "dryRun";
 const std::string kLastCommittedOpFieldName = "lastCommittedOp";
 const std::string kOkFieldName = "ok";
-const std::string kOpTimeFieldName = "ts";
 const std::string kReasonFieldName = "reason";
 const std::string kSetNameFieldName = "setName";
 const std::string kTermFieldName = "term";
@@ -54,7 +53,6 @@ const std::string kLegalArgsFieldNames[] = {
     kConfigVersionFieldName,
     kDryRunFieldName,
     kLastCommittedOpFieldName,
-    kOpTimeFieldName,
     kSetNameFieldName,
     kTermFieldName,
 };
@@ -91,18 +89,9 @@ Status ReplSetRequestVotesArgs::initialize(const BSONObj& argsObj) {
     if (!status.isOK())
         return status;
 
-    // extracting the lastCommittedOp is a bit of a process
-    BSONObj lastCommittedOp = argsObj[kLastCommittedOpFieldName].Obj();
-    Timestamp ts;
-    status = bsonExtractTimestampField(lastCommittedOp, kOpTimeFieldName, &ts);
+    status = bsonExtractOpTimeField(argsObj, kLastCommittedOpFieldName, &_lastCommittedOp);
     if (!status.isOK())
         return status;
-    long long term;
-    status = bsonExtractIntegerField(lastCommittedOp, kTermFieldName, &term);
-    if (!status.isOK())
-        return status;
-    _lastCommittedOp = OpTime(lastCommittedOp[kOpTimeFieldName].timestamp(),
-                              lastCommittedOp[kTermFieldName].Long());
 
     return Status::OK();
 }
@@ -138,10 +127,7 @@ void ReplSetRequestVotesArgs::addToBSON(BSONObjBuilder* builder) const {
     builder->append(kTermFieldName, _term);
     builder->appendIntOrLL(kCandidateIdFieldName, _candidateId);
     builder->appendIntOrLL(kConfigVersionFieldName, _cfgver);
-    BSONObjBuilder lastCommittedOp(builder->subobjStart(kLastCommittedOpFieldName));
-    lastCommittedOp.append(kOpTimeFieldName, _lastCommittedOp.getTimestamp());
-    lastCommittedOp.append(kTermFieldName, _lastCommittedOp.getTerm());
-    lastCommittedOp.done();
+    _lastCommittedOp.append(builder, kLastCommittedOpFieldName);
 }
 
 Status ReplSetRequestVotesResponse::initialize(const BSONObj& argsObj) {

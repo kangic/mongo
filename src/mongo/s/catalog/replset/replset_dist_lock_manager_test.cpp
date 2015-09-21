@@ -42,8 +42,8 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/service_context_noop.h"
 #include "mongo/s/catalog/dist_lock_catalog_mock.h"
-#include "mongo/s/type_lockpings.h"
-#include "mongo/s/type_locks.h"
+#include "mongo/s/catalog/type_lockpings.h"
+#include "mongo/s/catalog/type_locks.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/mutex.h"
@@ -65,7 +65,8 @@ using std::map;
 using std::string;
 using std::vector;
 
-const Seconds kUnlockTimeout(30);
+// Max duration to wait to satisfy test invariant before joining with main test thread.
+const Seconds kJoinTimeout(30);
 const Milliseconds kPingInterval(2);
 const Seconds kLockExpiration(10);
 
@@ -111,10 +112,9 @@ protected:
     void tearDown() override {
         // Don't care about what shutDown passes to stopPing here.
         _mockCatalog->expectStopPing([](StringData) {}, Status::OK());
-        _mgr.shutDown();
+        _mgr.shutDown(true);
     }
 
-    TickSourceMock _tickSource;
     std::unique_ptr<DistLockCatalogMock> _dummyDoNotUse;  // dummy placeholder
     DistLockCatalogMock* _mockCatalog;
     string _processID;
@@ -439,14 +439,14 @@ TEST_F(RSDistLockMgrWithMockTickSource, LockFailsAfterRetry) {
     {
         stdx::unique_lock<stdx::mutex> lk(unlockMutex);
         if (unlockCallCount == 0) {
-            didTimeout = unlockCV.wait_for(lk, kUnlockTimeout) == stdx::cv_status::timeout;
+            didTimeout = unlockCV.wait_for(lk, kJoinTimeout) == stdx::cv_status::timeout;
         }
     }
 
     // Join the background thread before trying to call asserts. Shutdown calls
     // stopPing and we don't care in this test.
     getMockCatalog()->expectStopPing([](StringData) {}, Status::OK());
-    getMgr()->shutDown();
+    getMgr()->shutDown(true);
 
     // No assert until shutDown has been called to make sure that the background thread
     // won't be trying to access the local variables that were captured by lamdas that
@@ -580,14 +580,14 @@ TEST_F(ReplSetDistLockManagerFixture, MustUnlockOnLockError) {
     {
         stdx::unique_lock<stdx::mutex> lk(unlockMutex);
         if (unlockCallCount == 0) {
-            didTimeout = unlockCV.wait_for(lk, kUnlockTimeout) == stdx::cv_status::timeout;
+            didTimeout = unlockCV.wait_for(lk, kJoinTimeout) == stdx::cv_status::timeout;
         }
     }
 
     // Join the background thread before trying to call asserts. Shutdown calls
     // stopPing and we don't care in this test.
     getMockCatalog()->expectStopPing([](StringData) {}, Status::OK());
-    getMgr()->shutDown();
+    getMgr()->shutDown(true);
 
     // No assert until shutDown has been called to make sure that the background thread
     // won't be trying to access the local variables that were captured by lamdas that
@@ -630,14 +630,14 @@ TEST_F(ReplSetDistLockManagerFixture, LockPinging) {
     {
         stdx::unique_lock<stdx::mutex> lk(testMutex);
         if (processIDList.size() < 3) {
-            didTimeout = ping3TimesCV.wait_for(lk, Milliseconds(50)) == stdx::cv_status::timeout;
+            didTimeout = ping3TimesCV.wait_for(lk, kJoinTimeout) == stdx::cv_status::timeout;
         }
     }
 
     // Join the background thread before trying to call asserts. Shutdown calls
     // stopPing and we don't care in this test.
     getMockCatalog()->expectStopPing([](StringData) {}, Status::OK());
-    getMgr()->shutDown();
+    getMgr()->shutDown(true);
 
     // No assert until shutDown has been called to make sure that the background thread
     // won't be trying to access the local variables that were captured by lamdas that
@@ -713,14 +713,14 @@ TEST_F(ReplSetDistLockManagerFixture, UnlockUntilNoError) {
     {
         stdx::unique_lock<stdx::mutex> lk(unlockMutex);
         if (lockSessionIDPassed.size() < kUnlockErrorCount) {
-            didTimeout = unlockCV.wait_for(lk, kUnlockTimeout) == stdx::cv_status::timeout;
+            didTimeout = unlockCV.wait_for(lk, kJoinTimeout) == stdx::cv_status::timeout;
         }
     }
 
     // Join the background thread before trying to call asserts. Shutdown calls
     // stopPing and we don't care in this test.
     getMockCatalog()->expectStopPing([](StringData) {}, Status::OK());
-    getMgr()->shutDown();
+    getMgr()->shutDown(true);
 
     // No assert until shutDown has been called to make sure that the background thread
     // won't be trying to access the local variables that were captured by lamdas that
@@ -809,14 +809,14 @@ TEST_F(ReplSetDistLockManagerFixture, MultipleQueuedUnlock) {
         stdx::unique_lock<stdx::mutex> lk(testMutex);
 
         if (unlockIDMap.size() < 2 || !mapEntriesGreaterThanTwo(unlockIDMap)) {
-            didTimeout = unlockCV.wait_for(lk, kUnlockTimeout) == stdx::cv_status::timeout;
+            didTimeout = unlockCV.wait_for(lk, kJoinTimeout) == stdx::cv_status::timeout;
         }
     }
 
     // Join the background thread before trying to call asserts. Shutdown calls
     // stopPing and we don't care in this test.
     getMockCatalog()->expectStopPing([](StringData) {}, Status::OK());
-    getMgr()->shutDown();
+    getMgr()->shutDown(true);
 
     // No assert until shutDown has been called to make sure that the background thread
     // won't be trying to access the local variables that were captured by lamdas that
@@ -840,7 +840,7 @@ TEST_F(ReplSetDistLockManagerFixture, CleanupPingOnShutdown) {
         stopPingCalled = true;
     }, Status::OK());
 
-    getMgr()->shutDown();
+    getMgr()->shutDown(true);
     ASSERT_TRUE(stopPingCalled);
 }
 
@@ -1597,14 +1597,14 @@ TEST_F(ReplSetDistLockManagerFixture, LockOvertakingResultsInError) {
     {
         stdx::unique_lock<stdx::mutex> lk(unlockMutex);
         if (!unlockSessionIDPassed.isSet()) {
-            didTimeout = unlockCV.wait_for(lk, kUnlockTimeout) == stdx::cv_status::timeout;
+            didTimeout = unlockCV.wait_for(lk, kJoinTimeout) == stdx::cv_status::timeout;
         }
     }
 
     // Join the background thread before trying to call asserts. Shutdown calls
     // stopPing and we don't care in this test.
     getMockCatalog()->expectStopPing([](StringData) {}, Status::OK());
-    getMgr()->shutDown();
+    getMgr()->shutDown(true);
 
     // No assert until shutDown has been called to make sure that the background thread
     // won't be trying to access the local variables that were captured by lamdas that
@@ -1743,6 +1743,90 @@ TEST_F(ReplSetDistLockManagerFixture, CannotOvertakeIfConfigServerClockGoesBackw
         ASSERT_NOT_OK(status);
         ASSERT_EQUALS(ErrorCodes::LockBusy, status.code());
     }
+}
+
+/**
+ * Test scenario:
+ * 1. Attempt to grab lock fails because lock is already owned.
+ * 2. Try to get ping data (does not exist) and config server clock.
+ * 3. Since we don't have previous ping data to compare with, we cannot
+ *    decide whether it's ok to overtake, so we can't.
+ * 4. Lock expiration has elapsed and the ping still does not exist.
+ * 5. 2nd attempt to grab lock still fails for the same reason.
+ * 6. But since the ping has not been updated, dist lock manager should overtake lock.
+ */
+TEST_F(RSDistLockMgrWithMockTickSource, CanOvertakeIfNoPingDocument) {
+    getMockCatalog()->expectGrabLock(
+        [](StringData, const OID&, StringData, StringData, Date_t, StringData) {
+            // Don't care
+        },
+        {ErrorCodes::LockStateChangeFailed, "nMod 0"});
+
+    LocksType currentLockDoc;
+    currentLockDoc.setName("bar");
+    currentLockDoc.setState(LocksType::LOCKED);
+    currentLockDoc.setProcess("otherProcess");
+    currentLockDoc.setLockID(OID("5572007fda9e476582bf3716"));
+    currentLockDoc.setWho("me");
+    currentLockDoc.setWhy("why");
+
+    getMockCatalog()->expectGetLockByName([](StringData name) { ASSERT_EQUALS("bar", name); },
+                                          currentLockDoc);
+
+    getMockCatalog()->expectGetPing([](StringData process) {
+        ASSERT_EQUALS("otherProcess", process);
+    }, {ErrorCodes::NoMatchingDocument, "no ping"});
+
+    getMockCatalog()->expectGetServerInfo([]() {}, DistLockCatalog::ServerInfo(Date_t(), OID()));
+
+    // First attempt will record the ping data.
+    {
+        auto status = getMgr()->lock("bar", "", Milliseconds(0), Milliseconds(0)).getStatus();
+        ASSERT_NOT_OK(status);
+        ASSERT_EQUALS(ErrorCodes::LockBusy, status.code());
+    }
+
+    OID lastTS;
+    getMockCatalog()->expectGrabLock(
+        [&lastTS](StringData, const OID& newTS, StringData, StringData, Date_t, StringData) {
+            lastTS = newTS;
+        },
+        {ErrorCodes::LockStateChangeFailed, "nMod 0"});
+
+    getMockCatalog()->expectGetLockByName([](StringData name) { ASSERT_EQUALS("bar", name); },
+                                          currentLockDoc);
+
+    getMockCatalog()->expectGetPing([](StringData process) {
+        ASSERT_EQUALS("otherProcess", process);
+    }, {ErrorCodes::NoMatchingDocument, "no ping"});
+
+    getMockCatalog()->expectGetServerInfo(
+        []() {}, DistLockCatalog::ServerInfo(Date_t() + kLockExpiration + Milliseconds(1), OID()));
+
+    getMockCatalog()->expectOvertakeLock(
+        [this, &lastTS, &currentLockDoc](StringData lockID,
+                                         const OID& lockSessionID,
+                                         const OID& currentHolderTS,
+                                         StringData who,
+                                         StringData processId,
+                                         Date_t time,
+                                         StringData why) {
+            ASSERT_EQUALS("bar", lockID);
+            ASSERT_EQUALS(lastTS, lockSessionID);
+            ASSERT_EQUALS(currentLockDoc.getLockID(), currentHolderTS);
+            ASSERT_EQUALS(getProcessID(), processId);
+            ASSERT_EQUALS("foo", why);
+        },
+        currentLockDoc);  // return arbitrary valid lock document, for testing purposes only.
+
+    getMockCatalog()->expectUnLock(
+        [](const OID&) {
+            // Don't care
+        },
+        Status::OK());
+
+    // Second attempt should overtake lock.
+    { ASSERT_OK(getMgr()->lock("bar", "foo", Milliseconds(0), Milliseconds(0)).getStatus()); }
 }
 
 }  // unnamed namespace

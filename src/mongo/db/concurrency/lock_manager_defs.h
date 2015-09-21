@@ -28,13 +28,12 @@
 
 #pragma once
 
-#include <boost/static_assert.hpp>
+#include <cstdint>
 #include <string>
 #include <limits>
 
 #include "mongo/base/string_data.h"
 #include "mongo/config.h"
-#include "mongo/platform/cstdint.h"
 #include "mongo/platform/hash_namespace.h"
 
 namespace mongo {
@@ -173,7 +172,8 @@ const char* resourceTypeName(ResourceType resourceType);
 class ResourceId {
     // We only use 3 bits for the resource type in the ResourceId hash
     enum { resourceTypeBits = 3 };
-    BOOST_STATIC_ASSERT(ResourceTypesCount <= (1 << resourceTypeBits));
+    static_assert(ResourceTypesCount <= (1 << resourceTypeBits),
+                  "ResourceTypesCount <= (1 << resourceTypeBits)");
 
 public:
     /**
@@ -184,7 +184,9 @@ public:
         SINGLETON_INVALID = 0,
         SINGLETON_PARALLEL_BATCH_WRITER_MODE,
         SINGLETON_GLOBAL,
-        SINGLETON_MMAPV1_FLUSH
+        SINGLETON_MMAPV1_FLUSH,
+        SINGLETON_CAPPED_IN_FLIGHT_OTHER_DB,
+        SINGLETON_CAPPED_IN_FLIGHT_LOCAL_DB,
     };
 
     ResourceId() : _fullHash(0) {}
@@ -235,7 +237,7 @@ private:
 #ifndef MONGO_CONFIG_DEBUG_BUILD
 // Treat the resource ids as 64-bit integers in release mode in order to ensure we do
 // not spend too much time doing comparisons for hashing.
-BOOST_STATIC_ASSERT(sizeof(ResourceId) == sizeof(uint64_t));
+static_assert(sizeof(ResourceId) == sizeof(uint64_t), "sizeof(ResourceId) == sizeof(uint64_t)");
 #endif
 
 
@@ -259,6 +261,18 @@ extern const ResourceId resourceIdAdminDB;
 // lock.
 // TODO: Merge this with resourceIdGlobal
 extern const ResourceId resourceIdParallelBatchWriterMode;
+
+// Everywhere that starts in-flight capped inserts which allocate capped collection RecordIds in
+// a way that could trigger hiding of newer records takes this lock in MODE_IX and holds it
+// until the end of their WriteUnitOfWork. The localDb resource is for capped collections in the
+// local database (including the oplog). The otherDb resource is for capped collections in any other
+// database.
+//
+// Threads that need a consistent view of the world can lock both of these in MODE_X to prevent
+// concurrent in-flight capped inserts. The otherDb resource must be acquired before the localDb
+// resource.
+extern const ResourceId resourceCappedInFlightForLocalDb;
+extern const ResourceId resourceCappedInFlightForOtherDb;
 
 /**
  * Interface on which granted lock requests will be notified. See the contract for the notify

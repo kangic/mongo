@@ -36,6 +36,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/repl/operation_context_repl_mock.h"
+#include "mongo/db/storage/snapshot_name.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/sequence_util.h"
 
@@ -51,13 +52,15 @@ ReplicationCoordinatorExternalStateMock::ReplicationCoordinatorExternalStateMock
       _storeLocalLastVoteDocumentStatus(Status::OK()),
       _storeLocalConfigDocumentShouldHang(false),
       _storeLocalLastVoteDocumentShouldHang(false),
+      _isApplierSignaledToCancelFetcher(false),
       _connectionsClosed(false) {}
 
 ReplicationCoordinatorExternalStateMock::~ReplicationCoordinatorExternalStateMock() {}
 
 void ReplicationCoordinatorExternalStateMock::startThreads() {}
 void ReplicationCoordinatorExternalStateMock::startMasterSlave(OperationContext*) {}
-void ReplicationCoordinatorExternalStateMock::initiateOplog(OperationContext* txn) {}
+void ReplicationCoordinatorExternalStateMock::initiateOplog(OperationContext* txn,
+                                                            bool updateReplOpTime) {}
 void ReplicationCoordinatorExternalStateMock::shutdown() {}
 void ReplicationCoordinatorExternalStateMock::forwardSlaveProgress() {}
 
@@ -155,6 +158,10 @@ void ReplicationCoordinatorExternalStateMock::setStoreLocalConfigDocumentToHang(
     }
 }
 
+bool ReplicationCoordinatorExternalStateMock::isApplierSignaledToCancelFetcher() const {
+    return _isApplierSignaledToCancelFetcher;
+}
+
 void ReplicationCoordinatorExternalStateMock::setStoreLocalLastVoteDocumentStatus(Status status) {
     _storeLocalLastVoteDocumentStatus = status;
 }
@@ -177,12 +184,31 @@ void ReplicationCoordinatorExternalStateMock::clearShardingState() {}
 
 void ReplicationCoordinatorExternalStateMock::signalApplierToChooseNewSyncSource() {}
 
+void ReplicationCoordinatorExternalStateMock::signalApplierToCancelFetcher() {
+    _isApplierSignaledToCancelFetcher = true;
+}
+
 OperationContext* ReplicationCoordinatorExternalStateMock::createOperationContext(
     const std::string& threadName) {
     return new OperationContextReplMock;
 }
 
 void ReplicationCoordinatorExternalStateMock::dropAllTempCollections(OperationContext* txn) {}
+
+void ReplicationCoordinatorExternalStateMock::dropAllSnapshots() {}
+
+void ReplicationCoordinatorExternalStateMock::updateCommittedSnapshot(SnapshotName newCommitPoint) {
+}
+
+void ReplicationCoordinatorExternalStateMock::forceSnapshotCreation() {}
+
+bool ReplicationCoordinatorExternalStateMock::snapshotsEnabled() const {
+    return true;
+}
+
+void ReplicationCoordinatorExternalStateMock::logTransitionToPrimaryToOplog(OperationContext* txn) {
+    _lastOpTime = OpTime(Timestamp(1, 0), 1);
+}
 
 }  // namespace repl
 }  // namespace mongo

@@ -135,8 +135,8 @@ Status cloneCollectionAsCapped(OperationContext* txn,
 
     long long excessSize = fromCollection->dataSize(txn) - allocatedSpaceGuess;
 
-    std::unique_ptr<PlanExecutor> exec(
-        InternalPlanner::collectionScan(txn, fromNs, fromCollection, InternalPlanner::FORWARD));
+    std::unique_ptr<PlanExecutor> exec(InternalPlanner::collectionScan(
+        txn, fromNs, fromCollection, PlanExecutor::YIELD_MANUAL, InternalPlanner::FORWARD));
 
     exec->setYieldPolicy(PlanExecutor::WRITE_CONFLICT_RETRY_ONLY);
 
@@ -197,7 +197,7 @@ Status cloneCollectionAsCapped(OperationContext* txn,
             // around call to abandonSnapshot.
             exec->saveState();
             txn->recoveryUnit()->abandonSnapshot();
-            exec->restoreState(txn);  // Handles any WCEs internally.
+            exec->restoreState();  // Handles any WCEs internally.
         }
     }
 

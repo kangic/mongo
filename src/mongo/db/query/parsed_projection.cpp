@@ -66,6 +66,7 @@ Status ParsedProjection::make(const BSONObj& spec,
 
     bool wantGeoNearPoint = false;
     bool wantGeoNearDistance = false;
+    bool wantSortKey = false;
 
     // Until we see a positional or elemMatch operator we're normal.
     ArrayOpType arrayOpType = ARRAY_OP_NORMAL;
@@ -129,12 +130,11 @@ Status ParsedProjection::make(const BSONObj& spec,
                 verify(elemMatchObj.isOwned());
 
                 // TODO: Is there a faster way of validating the elemMatchObj?
-                StatusWithMatchExpression swme =
+                StatusWithMatchExpression statusWithMatcher =
                     MatchExpressionParser::parse(elemMatchObj, whereCallback);
-                if (!swme.isOK()) {
-                    return swme.getStatus();
+                if (!statusWithMatcher.isOK()) {
+                    return statusWithMatcher.getStatus();
                 }
-                delete swme.getValue();
             } else if (mongoutils::str::equals(e2.fieldName(), "$meta")) {
                 // Field for meta must be top level.  We can relax this at some point.
                 if (mongoutils::str::contains(e.fieldName(), '.')) {
@@ -151,7 +151,8 @@ Status ParsedProjection::make(const BSONObj& spec,
                     e2.valuestr() != LiteParsedQuery::metaRecordId &&
                     e2.valuestr() != LiteParsedQuery::metaIndexKey &&
                     e2.valuestr() != LiteParsedQuery::metaGeoNearDistance &&
-                    e2.valuestr() != LiteParsedQuery::metaGeoNearPoint) {
+                    e2.valuestr() != LiteParsedQuery::metaGeoNearPoint &&
+                    e2.valuestr() != LiteParsedQuery::metaSortKey) {
                     return Status(ErrorCodes::BadValue, "unsupported $meta operator: " + e2.str());
                 }
 
@@ -162,6 +163,8 @@ Status ParsedProjection::make(const BSONObj& spec,
                     wantGeoNearDistance = true;
                 } else if (e2.valuestr() == LiteParsedQuery::metaGeoNearPoint) {
                     wantGeoNearPoint = true;
+                } else if (e2.valuestr() == LiteParsedQuery::metaSortKey) {
+                    wantSortKey = true;
                 }
             } else {
                 return Status(ErrorCodes::BadValue,
@@ -243,9 +246,10 @@ Status ParsedProjection::make(const BSONObj& spec,
     // missing."
     pp->_requiresDocument = include || hasNonSimple || hasDottedField;
 
-    // Add geoNear projections.
+    // Add meta-projections.
     pp->_wantGeoNearPoint = wantGeoNearPoint;
     pp->_wantGeoNearDistance = wantGeoNearDistance;
+    pp->_wantSortKey = wantSortKey;
 
     // If it's possible to compute the projection in a covered fashion, populate _requiredFields
     // so the planner can perform projection analysis.
@@ -269,8 +273,8 @@ Status ParsedProjection::make(const BSONObj& spec,
         }
     }
 
-    // returnKey clobbers everything.
-    if (hasIndexKeyProjection) {
+    // returnKey clobbers everything except for sortKey meta-projection.
+    if (hasIndexKeyProjection && !wantSortKey) {
         pp->_requiresDocument = false;
     }
 

@@ -7,6 +7,7 @@
  * running the queries against collection 'coll'.
  */
 function testBatchSize(coll) {
+	//Roll the cursor over the second batch and make sure it's correctly sized
     assert.eq(20, coll.find().sort({x: 1}).batchSize(3).itcount());
     assert.eq(15, coll.find().sort({x: 1}).batchSize(3).skip(5).itcount());
 }
@@ -84,10 +85,12 @@ for (var i=1; i<=10; ++i) {
 //
 
 jsTest.log("Running batchSize tests against sharded collection.");
-testBatchSize(shardedCol, st.shard0);
+st.shard0.adminCommand({setParameter: 1, logLevel : 1});
+testBatchSize(shardedCol);
+st.shard0.adminCommand({setParameter: 1, logLevel : 0});
 
 jsTest.log("Running batchSize tests against non-sharded collection.");
-testBatchSize(unshardedCol, st.shard0);
+testBatchSize(unshardedCol);
 
 //
 // Run tests for limit. These should *not* issue getmores. We confirm this

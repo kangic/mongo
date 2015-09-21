@@ -33,21 +33,25 @@
 
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/expression_context.h"
+#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
 using boost::intrusive_ptr;
 using std::shared_ptr;
+using std::unique_ptr;
 using std::vector;
+using stdx::make_unique;
 
 const char* PipelineProxyStage::kStageType = "PIPELINE_PROXY";
 
-PipelineProxyStage::PipelineProxyStage(intrusive_ptr<Pipeline> pipeline,
+PipelineProxyStage::PipelineProxyStage(OperationContext* opCtx,
+                                       intrusive_ptr<Pipeline> pipeline,
                                        const std::shared_ptr<PlanExecutor>& child,
                                        WorkingSet* ws)
-    : _pipeline(pipeline),
-      _includeMetaData(_pipeline->getContext()->inShard)  // send metadata to merger
-      ,
+    : PlanStage(kStageType, opCtx),
+      _pipeline(pipeline),
+      _includeMetaData(_pipeline->getContext()->inShard),  // send metadata to merger
       _childExec(child),
       _ws(ws) {}
 
@@ -61,7 +65,7 @@ PlanStage::StageState PipelineProxyStage::work(WorkingSetID* out) {
         WorkingSetMember* member = _ws->get(*out);
         member->obj = Snapshotted<BSONObj>(SnapshotId(), _stash.back());
         _stash.pop_back();
-        member->state = WorkingSetMember::OWNED_OBJ;
+        member->transitionToOwnedObj();
         return PlanStage::ADVANCED;
     }
 
@@ -69,7 +73,7 @@ PlanStage::StageState PipelineProxyStage::work(WorkingSetID* out) {
         *out = _ws->allocate();
         WorkingSetMember* member = _ws->get(*out);
         member->obj = Snapshotted<BSONObj>(SnapshotId(), *next);
-        member->state = WorkingSetMember::OWNED_OBJ;
+        member->transitionToOwnedObj();
         return PlanStage::ADVANCED;
     }
 
@@ -88,38 +92,35 @@ bool PipelineProxyStage::isEOF() {
     return true;
 }
 
-void PipelineProxyStage::invalidate(OperationContext* txn,
-                                    const RecordId& dl,
-                                    InvalidationType type) {
+void PipelineProxyStage::doInvalidate(OperationContext* txn,
+                                      const RecordId& dl,
+                                      InvalidationType type) {
     // propagate to child executor if still in use
     if (std::shared_ptr<PlanExecutor> exec = _childExec.lock()) {
         exec->invalidate(txn, dl, type);
     }
 }
 
-void PipelineProxyStage::saveState() {
+void PipelineProxyStage::doDetachFromOperationContext() {
     _pipeline->getContext()->opCtx = NULL;
+    if (auto child = getChildExecutor()) {
+        child->detachFromOperationContext();
+    }
 }
 
-void PipelineProxyStage::restoreState(OperationContext* opCtx) {
+void PipelineProxyStage::doReattachToOperationContext() {
     invariant(_pipeline->getContext()->opCtx == NULL);
-    _pipeline->getContext()->opCtx = opCtx;
+    _pipeline->getContext()->opCtx = getOpCtx();
+    if (auto child = getChildExecutor()) {
+        child->reattachToOperationContext(getOpCtx());
+    }
 }
 
-void PipelineProxyStage::pushBack(const BSONObj& obj) {
-    _stash.push_back(obj);
-}
-
-vector<PlanStage*> PipelineProxyStage::getChildren() const {
-    vector<PlanStage*> empty;
-    return empty;
-}
-
-PlanStageStats* PipelineProxyStage::getStats() {
-    std::unique_ptr<PlanStageStats> ret(
-        new PlanStageStats(CommonStats(kStageType), STAGE_PIPELINE_PROXY));
-    ret->specific.reset(new CollectionScanStats());
-    return ret.release();
+unique_ptr<PlanStageStats> PipelineProxyStage::getStats() {
+    unique_ptr<PlanStageStats> ret =
+        make_unique<PlanStageStats>(CommonStats(kStageType), STAGE_PIPELINE_PROXY);
+    ret->specific = make_unique<CollectionScanStats>();
+    return ret;
 }
 
 boost::optional<BSONObj> PipelineProxyStage::getNextBson() {

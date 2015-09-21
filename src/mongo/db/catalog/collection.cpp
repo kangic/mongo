@@ -55,6 +55,7 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/mmap_v1/mmap_v1_options.h"
 #include "mongo/db/storage/record_fetcher.h"
+#include "mongo/db/storage/record_store.h"
 
 #include "mongo/db/auth/user_document_parser.h"  // XXX-ANDY
 #include "mongo/util/log.h"
@@ -65,6 +66,7 @@ namespace {
 const auto bannedExpressionsInValidators = std::set<StringData>{
     "$geoNear", "$near", "$nearSphere", "$text", "$where",
 };
+
 Status checkValidatorForBannedExpressions(const BSONObj& validator) {
     for (auto field : validator) {
         const auto name = field.fieldNameStringData();
@@ -114,11 +116,19 @@ std::string CompactOptions::toString() const {
 // CappedInsertNotifier
 //
 
-CappedInsertNotifier::CappedInsertNotifier() : _cappedInsertCount(0) {}
+CappedInsertNotifier::CappedInsertNotifier() : _cappedInsertCount(0), _dead(false) {}
 
-void CappedInsertNotifier::notifyOfInsert() {
+void CappedInsertNotifier::notifyOfInsert(int count) {
     stdx::lock_guard<stdx::mutex> lk(_cappedNewDataMutex);
-    _cappedInsertCount++;
+    if (!_dead) {
+        _cappedInsertCount += count;
+    }
+    _cappedNewDataNotifier.notify_all();
+}
+
+void CappedInsertNotifier::notifyAll() {
+    stdx::lock_guard<stdx::mutex> lk(_cappedNewDataMutex);
+    ++_cappedInsertCount;
     _cappedNewDataNotifier.notify_all();
 }
 
@@ -129,12 +139,29 @@ uint64_t CappedInsertNotifier::getCount() const {
 
 void CappedInsertNotifier::waitForInsert(uint64_t referenceCount, Microseconds timeout) const {
     stdx::unique_lock<stdx::mutex> lk(_cappedNewDataMutex);
-
-    while (referenceCount == _cappedInsertCount) {
+    while (!_dead && referenceCount == _cappedInsertCount) {
         if (stdx::cv_status::timeout == _cappedNewDataNotifier.wait_for(lk, timeout)) {
             return;
         }
     }
+}
+
+void CappedInsertNotifier::waitForInsert(uint64_t referenceCount) const {
+    stdx::unique_lock<stdx::mutex> lk(_cappedNewDataMutex);
+    while (!_dead && referenceCount == _cappedInsertCount) {
+        _cappedNewDataNotifier.wait(lk);
+    }
+}
+
+void CappedInsertNotifier::kill() {
+    stdx::lock_guard<stdx::mutex> lk(_cappedNewDataMutex);
+    _dead = true;
+    _cappedNewDataNotifier.notify_all();
+}
+
+bool CappedInsertNotifier::isDead() {
+    stdx::lock_guard<stdx::mutex> lk(_cappedNewDataMutex);
+    return _dead;
 }
 
 // ----
@@ -152,18 +179,27 @@ Collection::Collection(OperationContext* txn,
       _indexCatalog(this),
       _validatorDoc(_details->getCollectionOptions(txn).validator.getOwned()),
       _validator(uassertStatusOK(parseValidator(_validatorDoc))),
+      _validationAction(uassertStatusOK(
+          _parseValidationAction(_details->getCollectionOptions(txn).validationAction))),
+      _validationLevel(uassertStatusOK(
+          _parseValidationLevel(_details->getCollectionOptions(txn).validationLevel))),
       _cursorManager(fullNS),
-      _cappedNotifier(_recordStore->isCapped() ? new CappedInsertNotifier() : nullptr) {
+      _cappedNotifier(_recordStore->isCapped() ? new CappedInsertNotifier() : nullptr),
+      _mustTakeCappedLockOnInsert(isCapped() && !_ns.isSystemDotProfile() && !_ns.isOplog()) {
     _magic = 1357924;
     _indexCatalog.init(txn);
     if (isCapped())
-        _recordStore->setCappedDeleteCallback(this);
-    _infoCache.reset(txn);
+        _recordStore->setCappedCallback(this);
+
+    _infoCache.init(txn);
 }
 
 Collection::~Collection() {
     verify(ok());
     _magic = 0;
+    if (_cappedNotifier) {
+        _cappedNotifier->kill();
+    }
 }
 
 bool Collection::requiresIdIndex() const {
@@ -193,7 +229,8 @@ bool Collection::requiresIdIndex() const {
     return true;
 }
 
-std::unique_ptr<RecordCursor> Collection::getCursor(OperationContext* txn, bool forward) const {
+std::unique_ptr<SeekableRecordCursor> Collection::getCursor(OperationContext* txn,
+                                                            bool forward) const {
     dassert(txn->lockState()->isCollectionLockedForMode(ns().toString(), MODE_IS));
     invariant(ok());
 
@@ -227,17 +264,25 @@ Status Collection::checkValidation(OperationContext* txn, const BSONObj& documen
     if (!_validator)
         return Status::OK();
 
+    if (_validationLevel == OFF)
+        return Status::OK();
+
     if (documentValidationDisabled(txn))
         return Status::OK();
 
     if (_validator->matchesBSON(document))
         return Status::OK();
 
+    if (_validationAction == WARN) {
+        warning() << "Document would fail validation"
+                  << " collection: " << ns() << " doc: " << document;
+        return Status::OK();
+    }
+
     return {ErrorCodes::DocumentValidationFailure, "Document failed validation"};
 }
 
-StatusWith<std::unique_ptr<MatchExpression>> Collection::parseValidator(
-    const BSONObj& validator) const {
+StatusWithMatchExpression Collection::parseValidator(const BSONObj& validator) const {
     if (validator.isEmpty())
         return {nullptr};
 
@@ -258,71 +303,88 @@ StatusWith<std::unique_ptr<MatchExpression>> Collection::parseValidator(
             return status;
     }
 
-    auto statusWithRawPtr = MatchExpressionParser::parse(validator);
-    if (!statusWithRawPtr.isOK())
-        return statusWithRawPtr.getStatus();
+    auto statusWithMatcher = MatchExpressionParser::parse(validator);
+    if (!statusWithMatcher.isOK())
+        return statusWithMatcher.getStatus();
 
-    return {std::unique_ptr<MatchExpression>(statusWithRawPtr.getValue())};
+    return statusWithMatcher;
 }
 
-StatusWith<RecordId> Collection::insertDocument(OperationContext* txn,
-                                                const DocWriter* doc,
-                                                bool enforceQuota) {
+Status Collection::insertDocument(OperationContext* txn, const DocWriter* doc, bool enforceQuota) {
     invariant(!_validator || documentValidationDisabled(txn));
     dassert(txn->lockState()->isCollectionLockedForMode(ns().toString(), MODE_IX));
     invariant(!_indexCatalog.haveAnyIndexes());  // eventually can implement, just not done
 
+    if (_mustTakeCappedLockOnInsert)
+        synchronizeOnCappedInFlightResource(txn->lockState(), _ns);
+
     StatusWith<RecordId> loc = _recordStore->insertRecord(txn, doc, _enforceQuota(enforceQuota));
     if (!loc.isOK())
-        return loc;
+        return loc.getStatus();
 
     // we cannot call into the OpObserver here because the document being written is not present
     // fortunately, this is currently only used for adding entries to the oplog.
 
-    return StatusWith<RecordId>(loc);
+    txn->recoveryUnit()->onCommit([this]() { notifyCappedWaitersIfNeeded(); });
+
+    return loc.getStatus();
 }
 
-StatusWith<RecordId> Collection::insertDocument(OperationContext* txn,
-                                                const BSONObj& docToInsert,
-                                                bool enforceQuota,
-                                                bool fromMigrate) {
-    {
-        auto status = checkValidation(txn, docToInsert);
+
+Status Collection::insertDocuments(OperationContext* txn,
+                                   vector<BSONObj>::iterator begin,
+                                   vector<BSONObj>::iterator end,
+                                   bool enforceQuota,
+                                   bool fromMigrate) {
+    // Should really be done in the collection object at creation and updated on index create.
+    const bool hasIdIndex = _indexCatalog.findIdIndex(txn);
+
+    for (vector<BSONObj>::iterator it = begin; it != end; it++) {
+        if (hasIdIndex && (*it)["_id"].eoo()) {
+            return Status(ErrorCodes::InternalError,
+                          str::stream() << "Collection::insertDocument got "
+                                           "document without _id for ns:" << _ns.ns());
+        }
+
+        auto status = checkValidation(txn, *it);
         if (!status.isOK())
             return status;
     }
 
     const SnapshotId sid = txn->recoveryUnit()->getSnapshotId();
 
-    if (_indexCatalog.findIdIndex(txn)) {
-        if (docToInsert["_id"].eoo()) {
-            return StatusWith<RecordId>(ErrorCodes::InternalError,
-                                        str::stream()
-                                            << "Collection::insertDocument got "
-                                               "document without _id for ns:" << _ns.ns());
-        }
-    }
+    if (_mustTakeCappedLockOnInsert)
+        synchronizeOnCappedInFlightResource(txn->lockState(), _ns);
 
-    StatusWith<RecordId> res = _insertDocument(txn, docToInsert, enforceQuota);
+    Status status = _insertDocuments(txn, begin, end, enforceQuota);
+    if (!status.isOK())
+        return status;
     invariant(sid == txn->recoveryUnit()->getSnapshotId());
-    if (res.isOK()) {
-        getGlobalServiceContext()->getOpObserver()->onInsert(txn, ns(), docToInsert, fromMigrate);
 
-        // If there is a notifier object and another thread is waiting on it, then we notify
-        // waiters of this document insert. Waiters keep a shared_ptr to '_cappedNotifier', so
-        // there are waiters if this Collection's shared_ptr is not unique.
-        if (_cappedNotifier && !_cappedNotifier.unique()) {
-            _cappedNotifier->notifyOfInsert();
-        }
+    int inserted = 0;
+    for (vector<BSONObj>::iterator it = begin; it != end; it++) {  // TODO: vectorize
+        getGlobalServiceContext()->getOpObserver()->onInsert(txn, ns(), *it, fromMigrate);
+        inserted++;
     }
 
-    return res;
+    txn->recoveryUnit()->onCommit([this]() { notifyCappedWaitersIfNeeded(); });
+
+    return Status::OK();
 }
 
-StatusWith<RecordId> Collection::insertDocument(OperationContext* txn,
-                                                const BSONObj& doc,
-                                                MultiIndexBlock* indexBlock,
-                                                bool enforceQuota) {
+Status Collection::insertDocument(OperationContext* txn,
+                                  const BSONObj& docToInsert,
+                                  bool enforceQuota,
+                                  bool fromMigrate) {
+    vector<BSONObj> docs;
+    docs.push_back(docToInsert);
+    return insertDocuments(txn, docs.begin(), docs.end(), enforceQuota, fromMigrate);
+}
+
+Status Collection::insertDocument(OperationContext* txn,
+                                  const BSONObj& doc,
+                                  MultiIndexBlock* indexBlock,
+                                  bool enforceQuota) {
     {
         auto status = checkValidation(txn, doc);
         if (!status.isOK())
@@ -331,52 +393,59 @@ StatusWith<RecordId> Collection::insertDocument(OperationContext* txn,
 
     dassert(txn->lockState()->isCollectionLockedForMode(ns().toString(), MODE_IX));
 
+    if (_mustTakeCappedLockOnInsert)
+        synchronizeOnCappedInFlightResource(txn->lockState(), _ns);
+
     StatusWith<RecordId> loc =
         _recordStore->insertRecord(txn, doc.objdata(), doc.objsize(), _enforceQuota(enforceQuota));
 
     if (!loc.isOK())
-        return loc;
+        return loc.getStatus();
 
     Status status = indexBlock->insert(doc, loc.getValue());
     if (!status.isOK())
-        return StatusWith<RecordId>(status);
+        return status;
 
     getGlobalServiceContext()->getOpObserver()->onInsert(txn, ns(), doc);
 
-    // If there is a notifier object and another thread is waiting on it, then we notify waiters
-    // of this document insert. Waiters keep a shared_ptr to '_cappedNotifier', so there are
-    // waiters if this Collection's shared_ptr is not unique.
-    if (_cappedNotifier && !_cappedNotifier.unique()) {
-        _cappedNotifier->notifyOfInsert();
-    }
+    txn->recoveryUnit()->onCommit([this]() { notifyCappedWaitersIfNeeded(); });
 
-    return loc;
+    return loc.getStatus();
 }
 
-StatusWith<RecordId> Collection::_insertDocument(OperationContext* txn,
-                                                 const BSONObj& docToInsert,
-                                                 bool enforceQuota) {
+Status Collection::_insertDocuments(OperationContext* txn,
+                                    vector<BSONObj>::iterator begin,
+                                    vector<BSONObj>::iterator end,
+                                    bool enforceQuota) {
     dassert(txn->lockState()->isCollectionLockedForMode(ns().toString(), MODE_IX));
 
     // TODO: for now, capped logic lives inside NamespaceDetails, which is hidden
     //       under the RecordStore, this feels broken since that should be a
     //       collection access method probably
 
-    StatusWith<RecordId> loc = _recordStore->insertRecord(
-        txn, docToInsert.objdata(), docToInsert.objsize(), _enforceQuota(enforceQuota));
-    if (!loc.isOK())
-        return loc;
+    // insertRecord(s) will be vectorized in a future patch
+    std::vector<BsonRecord> bsonRecords;
+    for (vector<BSONObj>::iterator it = begin; it != end; it++) {
+        StatusWith<RecordId> loc = _recordStore->insertRecord(
+            txn, it->objdata(), it->objsize(), _enforceQuota(enforceQuota));
+        if (!loc.isOK())
+            return loc.getStatus();
+        BsonRecord bsonRecord = {loc.getValue(), &(*it)};
+        bsonRecords.push_back(bsonRecord);
 
-    invariant(RecordId::min() < loc.getValue());
-    invariant(loc.getValue() < RecordId::max());
+        invariant(RecordId::min() < loc.getValue());
+        invariant(loc.getValue() < RecordId::max());
+    }
 
-    _infoCache.notifyOfWriteOp();
+    return _indexCatalog.indexRecords(txn, bsonRecords);
+}
 
-    Status s = _indexCatalog.indexRecord(txn, docToInsert, loc.getValue());
-    if (!s.isOK())
-        return StatusWith<RecordId>(s);
-
-    return loc;
+void Collection::notifyCappedWaitersIfNeeded() {
+    // If there is a notifier object and another thread is waiting on it, then we notify
+    // waiters of this document insert. Waiters keep a shared_ptr to '_cappedNotifier', so
+    // there are waiters if this Collection's shared_ptr is not unique (use_count > 1).
+    if (_cappedNotifier && !_cappedNotifier.unique())
+        _cappedNotifier->notifyAll();
 }
 
 Status Collection::aboutToDeleteCapped(OperationContext* txn,
@@ -417,8 +486,6 @@ void Collection::deleteDocument(
 
     _recordStore->deleteRecord(txn, loc);
 
-    _infoCache.notifyOfWriteOp();
-
     if (!id.isEmpty()) {
         getGlobalServiceContext()->getOpObserver()->onDelete(txn, ns().ns(), id);
     }
@@ -437,8 +504,18 @@ StatusWith<RecordId> Collection::updateDocument(OperationContext* txn,
                                                 oplogUpdateEntryArgs& args) {
     {
         auto status = checkValidation(txn, newDoc);
-        if (!status.isOK())
-            return status;
+        if (!status.isOK()) {
+            if (_validationLevel == STRICT_V) {
+                return status;
+            }
+            // moderate means we have to check the old doc
+            auto oldDocStatus = checkValidation(txn, oldDoc.value());
+            if (oldDocStatus.isOK()) {
+                // transitioning from good -> bad is not ok
+                return status;
+            }
+            // bad -> bad is ok in moderate mode
+        }
     }
 
     dassert(txn->lockState()->isCollectionLockedForMode(ns().toString(), MODE_IX));
@@ -492,11 +569,7 @@ StatusWith<RecordId> Collection::updateDocument(OperationContext* txn,
     }
 
     // At this point, the old object may or may not still be indexed, depending on if it was
-    // moved.
-
-    _infoCache.notifyOfWriteOp();
-
-    // If the object did move, we need to add the new location to all indexes.
+    // moved. If the object did move, we need to add the new location to all indexes.
     if (newLocation.getValue() != oldLocation) {
         if (debug) {
             if (debug->nmoved == -1)  // default of -1 rather than 0
@@ -505,7 +578,10 @@ StatusWith<RecordId> Collection::updateDocument(OperationContext* txn,
                 debug->nmoved += 1;
         }
 
-        Status s = _indexCatalog.indexRecord(txn, newDoc, newLocation.getValue());
+        std::vector<BsonRecord> bsonRecords;
+        BsonRecord bsonRecord = {newLocation.getValue(), &newDoc};
+        bsonRecords.push_back(bsonRecord);
+        Status s = _indexCatalog.indexRecords(txn, bsonRecords);
         if (!s.isOK())
             return StatusWith<RecordId>(s);
         invariant(sid == txn->recoveryUnit()->getSnapshotId());
@@ -566,12 +642,13 @@ bool Collection::updateWithDamagesSupported() const {
     return _recordStore->updateWithDamagesSupported();
 }
 
-Status Collection::updateDocumentWithDamages(OperationContext* txn,
-                                             const RecordId& loc,
-                                             const Snapshotted<RecordData>& oldRec,
-                                             const char* damageSource,
-                                             const mutablebson::DamageVector& damages,
-                                             oplogUpdateEntryArgs& args) {
+StatusWith<RecordData> Collection::updateDocumentWithDamages(
+    OperationContext* txn,
+    const RecordId& loc,
+    const Snapshotted<RecordData>& oldRec,
+    const char* damageSource,
+    const mutablebson::DamageVector& damages,
+    oplogUpdateEntryArgs& args) {
     dassert(txn->lockState()->isCollectionLockedForMode(ns().toString(), MODE_IX));
     invariant(oldRec.snapshotId() == txn->recoveryUnit()->getSnapshotId());
     invariant(updateWithDamagesSupported());
@@ -579,14 +656,14 @@ Status Collection::updateDocumentWithDamages(OperationContext* txn,
     // Broadcast the mutation so that query results stay correct.
     _cursorManager.invalidateDocument(txn, loc, INVALIDATION_MUTATION);
 
-    Status status =
+    auto newRecStatus =
         _recordStore->updateWithDamages(txn, loc, oldRec.value(), damageSource, damages);
 
-    if (status.isOK()) {
+    if (newRecStatus.isOK()) {
         args.ns = ns().ns();
         getGlobalServiceContext()->getOpObserver()->onUpdate(txn, args);
     }
-    return status;
+    return newRecStatus;
 }
 
 bool Collection::_enforceQuota(bool userEnforeQuota) const {
@@ -670,7 +747,6 @@ Status Collection::truncate(OperationContext* txn) {
     if (!status.isOK())
         return status;
     _cursorManager.invalidateAll(false, "collection truncated");
-    _infoCache.reset(txn);
 
     // 3) truncate record store
     status = _recordStore->truncate(txn);
@@ -706,12 +782,95 @@ Status Collection::setValidator(OperationContext* txn, BSONObj validatorDoc) {
     if (!statusWithMatcher.isOK())
         return statusWithMatcher.getStatus();
 
-    _details->updateValidator(txn, validatorDoc);
+    _details->updateValidator(txn, validatorDoc, getValidationLevel(), getValidationAction());
 
     _validator = std::move(statusWithMatcher.getValue());
     _validatorDoc = std::move(validatorDoc);
     return Status::OK();
 }
+
+StatusWith<Collection::ValidationLevel> Collection::_parseValidationLevel(StringData newLevel) {
+    if (newLevel == "") {
+        // default
+        return STRICT_V;
+    } else if (newLevel == "off") {
+        return OFF;
+    } else if (newLevel == "moderate") {
+        return MODERATE;
+    } else if (newLevel == "strict") {
+        return STRICT_V;
+    } else {
+        return Status(ErrorCodes::BadValue,
+                      str::stream() << "invalid validation level: " << newLevel);
+    }
+}
+
+StatusWith<Collection::ValidationAction> Collection::_parseValidationAction(StringData newAction) {
+    if (newAction == "") {
+        // default
+        return ERROR_V;
+    } else if (newAction == "warn") {
+        return WARN;
+    } else if (newAction == "error") {
+        return ERROR_V;
+    } else {
+        return Status(ErrorCodes::BadValue,
+                      str::stream() << "invalid validation action: " << newAction);
+    }
+}
+
+StringData Collection::getValidationLevel() const {
+    switch (_validationLevel) {
+        case STRICT_V:
+            return "strict";
+        case OFF:
+            return "off";
+        case MODERATE:
+            return "moderate";
+    }
+    MONGO_UNREACHABLE;
+}
+
+StringData Collection::getValidationAction() const {
+    switch (_validationAction) {
+        case ERROR_V:
+            return "error";
+        case WARN:
+            return "warn";
+    }
+    MONGO_UNREACHABLE;
+}
+
+Status Collection::setValidationLevel(OperationContext* txn, StringData newLevel) {
+    invariant(txn->lockState()->isCollectionLockedForMode(ns().toString(), MODE_X));
+
+    StatusWith<ValidationLevel> status = _parseValidationLevel(newLevel);
+    if (!status.isOK()) {
+        return status.getStatus();
+    }
+
+    _validationLevel = status.getValue();
+
+    _details->updateValidator(txn, _validatorDoc, getValidationLevel(), getValidationAction());
+
+    return Status::OK();
+}
+
+Status Collection::setValidationAction(OperationContext* txn, StringData newAction) {
+    invariant(txn->lockState()->isCollectionLockedForMode(ns().toString(), MODE_X));
+
+    StatusWith<ValidationAction> status = _parseValidationAction(newAction);
+    if (!status.isOK()) {
+        return status.getStatus();
+    }
+
+    _validationAction = status.getValue();
+
+    _details->updateValidator(txn, _validatorDoc, getValidationLevel(), getValidationAction());
+
+    return Status::OK();
+}
+
 
 namespace {
 class MyValidateAdaptor : public ValidateAdaptor {

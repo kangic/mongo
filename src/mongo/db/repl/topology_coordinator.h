@@ -29,6 +29,7 @@
 #pragma once
 
 #include <string>
+#include <iosfwd>
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/db/repl/repl_set_heartbeat_response.h"
@@ -109,14 +110,14 @@ public:
      * Gets the latest term this member is aware of. If this member is the primary,
      * it's the current term of the replica set.
      */
-    virtual long long getTerm() const = 0;
+    virtual long long getTerm() = 0;
 
     /**
      * Sets the latest term this member is aware of to the higher of its current value and
      * the value passed in as "term".
      * Returns true if the local term value is changed.
      */
-    virtual bool updateTerm(long long term) = 0;
+    virtual bool updateTerm(long long term, Date_t now) = 0;
 
     ////////////////////////////////////////////////////////////
     //
@@ -132,7 +133,7 @@ public:
     /**
      * Chooses and sets a new sync source, based on our current knowledge of the world.
      */
-    virtual HostAndPort chooseNewSyncSource(Date_t now, const OpTime& lastOpApplied) = 0;
+    virtual HostAndPort chooseNewSyncSource(Date_t now, const Timestamp& lastTimestampApplied) = 0;
 
     /**
      * Suppresses selecting "host" as sync source until "until".
@@ -321,15 +322,18 @@ public:
         const OpTime& myLastOpApplied) = 0;
 
     /**
+     * Marks a member has down from our persepctive and returns a HeartbeatResponseAction, which
+     * will be StepDownSelf if we can no longer see a majority of the nodes.
+     */
+    virtual HeartbeatResponseAction setMemberAsDown(Date_t now,
+                                                    const int memberIndex,
+                                                    const OpTime& myLastOpApplied) = 0;
+
+    /**
      * If getRole() == Role::candidate and this node has not voted too recently, updates the
      * lastVote tracker and returns true.  Otherwise, returns false.
      */
     virtual bool voteForMyself(Date_t now) = 0;
-
-    /**
-     * Increase the term.
-     */
-    virtual void incrementTerm() = 0;
 
     /**
      * Set lastVote to be for ourself in this term.
@@ -380,7 +384,7 @@ public:
      * Considers whether or not this node should stand for election, and returns true
      * if the node has transitioned to candidate role as a result of the call.
      */
-    virtual bool checkShouldStandForElection(Date_t now, const OpTime& lastOpApplied) = 0;
+    virtual bool checkShouldStandForElection(Date_t now, const OpTime& lastOpApplied) const = 0;
 
     /**
      * Set the outgoing heartbeat message from self
@@ -390,8 +394,9 @@ public:
     /**
      * Prepares a BSONObj describing the current term, primary, and lastOp information.
      */
-    virtual void prepareCursorResponseInfo(BSONObjBuilder* objBuilder,
-                                           const OpTime& lastCommittedOpTime) const = 0;
+    virtual void prepareReplResponseMetadata(rpc::ReplSetMetadata* metadata,
+                                             const OpTime& lastVisibleOpTime,
+                                             const OpTime& lastCommittedOpTime) const = 0;
 
     /**
      * Writes into 'output' all the information needed to generate a summary of the current
@@ -423,14 +428,19 @@ public:
     virtual void loadLastVote(const LastVote& lastVote) = 0;
 
     /**
-     * Returns the most recent term this node is aware of.
-     */
-    virtual long long getTerm() = 0;
-
-    /**
      * Readies the TopologyCoordinator for stepdown.
      */
     virtual void prepareForStepDown() = 0;
+
+    /**
+     * Updates the current primary index.
+     */
+    virtual void setPrimaryIndex(long long primaryIndex) = 0;
+
+    /**
+     * Transitions to the candidate role if the node is electable.
+     */
+    virtual bool becomeCandidateIfElectable(const Date_t now, const OpTime& lastOpApplied) = 0;
 
 protected:
     TopologyCoordinator() {}
@@ -478,6 +488,12 @@ private:
 
     int _value;
 };
+
+//
+// Convenience method for unittest code. Please use accessors otherwise.
+//
+
+std::ostream& operator<<(std::ostream& os, TopologyCoordinator::Role role);
 
 }  // namespace repl
 }  // namespace mongo

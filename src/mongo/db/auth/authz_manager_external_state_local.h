@@ -40,6 +40,10 @@
 
 namespace mongo {
 
+namespace mutablebson {
+class Document;
+}  // namespace mutablebson
+
 /**
  * Common implementation of AuthzManagerExternalState for systems where role
  * and user information are stored locally.
@@ -50,16 +54,25 @@ class AuthzManagerExternalStateLocal : public AuthzManagerExternalState {
 public:
     virtual ~AuthzManagerExternalStateLocal() = default;
 
+    /**
+     * Takes a user document, and processes it with the RoleGraph, in order to recursively
+     * resolve roles and add the 'inheritedRoles', 'inheritedPrivileges',
+     * and 'warnings' fields.
+     */
+    void resolveUserRoles(mutablebson::Document* userDoc, const std::vector<RoleName>& directRoles);
+
     virtual Status initialize(OperationContext* txn);
 
     virtual Status getStoredAuthorizationVersion(OperationContext* txn, int* outVersion);
     virtual Status getUserDescription(OperationContext* txn,
                                       const UserName& userName,
                                       BSONObj* result);
-    virtual Status getRoleDescription(const RoleName& roleName,
+    virtual Status getRoleDescription(OperationContext* txn,
+                                      const RoleName& roleName,
                                       bool showPrivileges,
                                       BSONObj* result);
-    virtual Status getRoleDescriptionsForDB(const std::string dbname,
+    virtual Status getRoleDescriptionsForDB(OperationContext* txn,
+                                            const std::string dbname,
                                             bool showPrivileges,
                                             bool showBuiltinRoles,
                                             std::vector<BSONObj>* result);
@@ -94,13 +107,6 @@ public:
 protected:
     AuthzManagerExternalStateLocal() = default;
 
-    /**
-     * Fetches the user document for "userName" from local storage, and stores it into "result".
-     */
-    virtual Status _getUserDocument(OperationContext* txn,
-                                    const UserName& userName,
-                                    BSONObj* result);
-
 private:
     enum RoleGraphState {
         roleGraphStateInitial = 0,
@@ -117,6 +123,11 @@ private:
      * Initializes the role graph from the contents of the admin.system.roles collection.
      */
     Status _initializeRoleGraph(OperationContext* txn);
+
+    /**
+     * Fetches the user document for "userName" from local storage, and stores it into "result".
+     */
+    Status _getUserDocument(OperationContext* txn, const UserName& userName, BSONObj* result);
 
     Status _getRoleDescription_inlock(const RoleName& roleName,
                                       bool showPrivileges,

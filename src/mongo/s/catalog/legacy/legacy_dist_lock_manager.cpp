@@ -32,7 +32,7 @@
 
 #include "mongo/s/catalog/legacy/legacy_dist_lock_manager.h"
 
-#include "mongo/s/type_locks.h"
+#include "mongo/s/catalog/type_locks.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
 #include "mongo/util/timer.h"
@@ -58,7 +58,7 @@ void LegacyDistLockManager::startUp() {
     _pinger = stdx::make_unique<LegacyDistLockPinger>();
 }
 
-void LegacyDistLockManager::shutDown() {
+void LegacyDistLockManager::shutDown(bool allowNetworking) {
     stdx::unique_lock<stdx::mutex> sl(_mutex);
     _isStopped = true;
 
@@ -67,7 +67,7 @@ void LegacyDistLockManager::shutDown() {
     }
 
     if (_pinger) {
-        _pinger->shutdown();
+        _pinger->shutdown(allowNetworking);
     }
 }
 
@@ -99,8 +99,8 @@ StatusWith<DistLockManager::ScopedDistLock> LegacyDistLockManager::lock(
         bool acquired = false;
         BSONObj lockDoc;
         try {
-            acquired =
-                distLock->lock_try(whyMessage.toString(), &lockDoc, kDefaultSocketTimeout.count());
+            acquired = distLock->lock_try(
+                whyMessage.toString(), &lockDoc, durationCount<Seconds>(kDefaultSocketTimeout));
 
             if (!acquired) {
                 lastStatus = Status(ErrorCodes::LockBusy,
@@ -120,14 +120,14 @@ StatusWith<DistLockManager::ScopedDistLock> LegacyDistLockManager::lock(
         if (acquired) {
             verify(!lockDoc.isEmpty());
 
-            LocksType lock;
-            string errMsg;
-            if (!lock.parseBSON(lockDoc, &errMsg)) {
+            auto locksTypeResult = LocksType::fromBSON(lockDoc);
+            if (!locksTypeResult.isOK()) {
                 return StatusWith<ScopedDistLock>(
                     ErrorCodes::UnsupportedFormat,
-                    str::stream() << "error while parsing lock document: " << errMsg);
+                    str::stream() << "error while parsing lock document: " << lockDoc << " : "
+                                  << locksTypeResult.getStatus().toString());
             }
-
+            const LocksType& lock = locksTypeResult.getValue();
             dassert(lock.isLockIDSet());
 
             {
@@ -204,7 +204,7 @@ Status LegacyDistLockManager::checkStatus(const DistLockHandle& lockHandle) {
         distLock = iter->second.get();
     }
 
-    return distLock->checkStatus(kDefaultSocketTimeout.count());
+    return distLock->checkStatus(durationCount<Seconds>(kDefaultSocketTimeout));
 }
 
 void LegacyDistLockManager::enablePinger(bool enable) {

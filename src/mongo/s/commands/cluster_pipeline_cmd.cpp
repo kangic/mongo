@@ -31,15 +31,18 @@
 #include "mongo/platform/basic.h"
 
 #include <boost/intrusive_ptr.hpp>
+#include <initializer_list>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "mongo/base/status.h"
+#include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/pipeline.h"
+#include "mongo/platform/random.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/chunk_manager.h"
@@ -48,6 +51,7 @@
 #include "mongo/s/commands/cluster_commands_common.h"
 #include "mongo/s/config.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/query/store_possible_cursor.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/util/log.h"
 
@@ -85,10 +89,10 @@ public:
     }
 
     // virtuals from Command
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
-        Pipeline::addRequiredPrivileges(this, dbname, cmdObj, out);
+    Status checkAuthForCommand(ClientBasic* client,
+                               const std::string& dbname,
+                               const BSONObj& cmdObj) final {
+        return Pipeline::checkAuthForCommand(client, dbname, cmdObj);
     }
 
     virtual bool run(OperationContext* txn,
@@ -99,17 +103,15 @@ public:
                      BSONObjBuilder& result) {
         const string fullns = parseNs(dbname, cmdObj);
 
-        auto status = grid.catalogCache()->getDatabase(dbname);
+        auto status = grid.catalogCache()->getDatabase(txn, dbname);
         if (!status.isOK()) {
             return appendEmptyResultSet(result, status.getStatus(), fullns);
         }
 
         shared_ptr<DBConfig> conf = status.getValue();
 
-        // If the system isn't running sharded, or the target collection isn't sharded, pass
-        // this on to a mongod.
-        if (!conf->isShardingEnabled() || !conf->isSharded(fullns)) {
-            return aggPassthrough(conf, cmdObj, result, options);
+        if (!conf->isShardingEnabled()) {
+            return aggPassthrough(txn, conf, cmdObj, result, options);
         }
 
         intrusive_ptr<ExpressionContext> mergeCtx =
@@ -124,17 +126,26 @@ public:
             return false;
         }
 
+        for (auto&& ns : pipeline->getInvolvedCollections()) {
+            uassert(
+                28769, str::stream() << ns.ns() << " cannot be sharded", !conf->isSharded(ns.ns()));
+        }
+
+        if (!conf->isSharded(fullns)) {
+            return aggPassthrough(txn, conf, cmdObj, result, options);
+        }
+
         // If the first $match stage is an exact match on the shard key, we only have to send it
         // to one shard, so send the command to that shard.
         BSONObj firstMatchQuery = pipeline->getInitialQuery();
-        ChunkManagerPtr chunkMgr = conf->getChunkManager(fullns);
+        ChunkManagerPtr chunkMgr = conf->getChunkManager(txn, fullns);
         BSONObj shardKeyMatches = uassertStatusOK(
             chunkMgr->getShardKeyPattern().extractShardKeyFromQuery(firstMatchQuery));
 
-        // Don't need to split pipeline if the first $match is an exact match on shard key, but
-        // we can't send the entire pipeline to one shard if there is a $out stage, since that
-        // shard may not be the primary shard for the database.
-        bool needSplit = shardKeyMatches.isEmpty() || pipeline->hasOutStage();
+        // Don't need to split pipeline if the first $match is an exact match on shard key, unless
+        // there is a stage that needs to be run on the primary shard.
+        const bool needPrimaryShardMerger = pipeline->needsPrimaryShardMerger();
+        const bool needSplit = shardKeyMatches.isEmpty() || needPrimaryShardMerger;
 
         // Split the pipeline into pieces for mongod(s) and this mongos. If needSplit is true,
         // 'pipeline' will become the merger side.
@@ -150,13 +161,11 @@ public:
             commandBuilder.setField("cursor", Value(cmdObj["cursor"]));
         }
 
-        if (cmdObj.hasField("$queryOptions")) {
-            commandBuilder.setField("$queryOptions", Value(cmdObj["$queryOptions"]));
-        }
-
-        if (cmdObj.hasField(LiteParsedQuery::cmdOptionMaxTimeMS)) {
-            commandBuilder.setField(LiteParsedQuery::cmdOptionMaxTimeMS,
-                                    Value(cmdObj[LiteParsedQuery::cmdOptionMaxTimeMS]));
+        const std::initializer_list<StringData> fieldsToPropagateToShards = {
+            "$queryOptions", "readConcern", LiteParsedQuery::cmdOptionMaxTimeMS,
+        };
+        for (auto&& field : fieldsToPropagateToShards) {
+            commandBuilder[field] = Value(cmdObj[field]);
         }
 
         BSONObj shardedCommand = commandBuilder.freeze().toBson();
@@ -165,14 +174,15 @@ public:
         // Run the command on the shards
         // TODO need to make sure cursors are killed if a retry is needed
         vector<Strategy::CommandResult> shardResults;
-        Strategy::commandOp(dbname, shardedCommand, options, fullns, shardQuery, &shardResults);
+        Strategy::commandOp(
+            txn, dbname, shardedCommand, options, fullns, shardQuery, &shardResults);
 
         if (pipeline->isExplain()) {
             // This must be checked before we start modifying result.
             uassertAllShardsSupportExplain(shardResults);
 
             if (needSplit) {
-                result << "splitPipeline"
+                result << "needsPrimaryShardMerger" << needPrimaryShardMerger << "splitPipeline"
                        << DOC("shardsPart" << shardPipeline->writeExplainOps() << "mergerPart"
                                            << pipeline->writeExplainOps());
             } else {
@@ -191,8 +201,11 @@ public:
 
         if (!needSplit) {
             invariant(shardResults.size() == 1);
-            const auto& reply = shardResults[0].result;
-            storePossibleCursor(shardResults[0].target.toString(), reply);
+            const BSONObj reply =
+                uassertStatusOK(storePossibleCursor(shardResults[0].target.toString(),
+                                                    shardResults[0].result,
+                                                    grid.shardRegistry()->getExecutor(),
+                                                    grid.getCursorManager()));
             result.appendElements(reply);
             return reply["ok"].trueValue();
         }
@@ -212,15 +225,21 @@ public:
                 Value(cmdObj[LiteParsedQuery::cmdOptionMaxTimeMS]);
         }
 
+        // Not propagating readConcern to merger since it doesn't do local reads.
+
         string outputNsOrEmpty;
         if (DocumentSourceOut* out = dynamic_cast<DocumentSourceOut*>(pipeline->output())) {
             outputNsOrEmpty = out->getOutputNs().ns();
         }
 
-        // Run merging command on primary shard of database. Need to use ShardConnection so
-        // that the merging mongod is sent the config servers on connection init.
-        const auto shard = grid.shardRegistry()->getShard(conf->getPrimaryId());
-        ShardConnection conn(shard->getConnString(), outputNsOrEmpty);
+        // Run merging command on random shard, unless a stage needs the primary shard. Need to use
+        // ShardConnection so that the merging mongod is sent the config servers on connection init.
+        auto& prng = txn->getClient()->getPrng();
+        const auto& mergingShardId = needPrimaryShardMerger
+            ? conf->getPrimaryId()
+            : shardResults[prng.nextInt32(shardResults.size())].shardTargetId;
+        const auto mergingShard = grid.shardRegistry()->getShard(txn, mergingShardId);
+        ShardConnection conn(mergingShard->getConnString(), outputNsOrEmpty);
         BSONObj mergedResults =
             aggRunCommand(conn.get(), dbname, mergeCmd.freeze().toBson(), options);
         conn.done();
@@ -243,10 +262,14 @@ private:
     // host the command was run on which is necessary for cursor support. The exact host
     // could be different from conn->getServerAddress() for connections that map to
     // multiple servers such as for replica sets. These also take care of registering
-    // returned cursors with mongos's cursorCache.
+    // returned cursors.
     BSONObj aggRunCommand(DBClientBase* conn, const string& db, BSONObj cmd, int queryOptions);
 
-    bool aggPassthrough(DBConfigPtr conf, BSONObj cmd, BSONObjBuilder& result, int queryOptions);
+    bool aggPassthrough(OperationContext* txn,
+                        shared_ptr<DBConfig> conf,
+                        BSONObj cmd,
+                        BSONObjBuilder& result,
+                        int queryOptions);
 } clusterPipelineCmd;
 
 DocumentSourceMergeCursors::CursorIds PipelineCommand::parseCursors(
@@ -376,16 +399,20 @@ BSONObj PipelineCommand::aggRunCommand(DBClientBase* conn,
         throw RecvStaleConfigException("command failed because of stale config", result);
     }
 
-    uassertStatusOK(storePossibleCursor(cursor->originalHost(), result));
+    result = uassertStatusOK(storePossibleCursor(cursor->originalHost(),
+                                                 result,
+                                                 grid.shardRegistry()->getExecutor(),
+                                                 grid.getCursorManager()));
     return result;
 }
 
-bool PipelineCommand::aggPassthrough(DBConfigPtr conf,
+bool PipelineCommand::aggPassthrough(OperationContext* txn,
+                                     shared_ptr<DBConfig> conf,
                                      BSONObj cmd,
                                      BSONObjBuilder& out,
                                      int queryOptions) {
     // Temporary hack. See comment on declaration for details.
-    const auto shard = grid.shardRegistry()->getShard(conf->getPrimaryId());
+    const auto shard = grid.shardRegistry()->getShard(txn, conf->getPrimaryId());
     ShardConnection conn(shard->getConnString(), "");
     BSONObj result = aggRunCommand(conn.get(), conf->name(), cmd, queryOptions);
     conn.done();

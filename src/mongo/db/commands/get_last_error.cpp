@@ -168,7 +168,7 @@ public:
             // TODO(siyuan) Fix mongos to supply wOpTimeTerm, then parse out that value here
         } else {
             // TODO(siyuan) Don't use the default term after fixing mongos.
-            lastOpTime = repl::OpTime(lastTimestamp, repl::OpTime::kDefaultTerm);
+            lastOpTime = repl::OpTime(lastTimestamp, repl::OpTime::kInitialTerm);
         }
 
         OID electionId;
@@ -253,6 +253,7 @@ public:
         }
 
         txn->setWriteConcern(writeConcern);
+        setupSynchronousCommit(txn);
         {
             stdx::lock_guard<Client> lk(*txn->getClient());
             txn->setMessage_inlock("waiting for write concern");

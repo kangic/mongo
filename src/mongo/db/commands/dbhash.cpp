@@ -96,16 +96,18 @@ std::string DBHashCmd::hashCollection(OperationContext* opCtx,
 
     unique_ptr<PlanExecutor> exec;
     if (desc) {
-        exec.reset(InternalPlanner::indexScan(opCtx,
-                                              collection,
-                                              desc,
-                                              BSONObj(),
-                                              BSONObj(),
-                                              false,
-                                              InternalPlanner::FORWARD,
-                                              InternalPlanner::IXSCAN_FETCH));
+        exec = InternalPlanner::indexScan(opCtx,
+                                          collection,
+                                          desc,
+                                          BSONObj(),
+                                          BSONObj(),
+                                          false,  // endKeyInclusive
+                                          PlanExecutor::YIELD_MANUAL,
+                                          InternalPlanner::FORWARD,
+                                          InternalPlanner::IXSCAN_FETCH);
     } else if (collection->isCapped()) {
-        exec.reset(InternalPlanner::collectionScan(opCtx, fullCollectionName, collection));
+        exec = InternalPlanner::collectionScan(
+            opCtx, fullCollectionName, collection, PlanExecutor::YIELD_MANUAL);
     } else {
         log() << "can't find _id index for: " << fullCollectionName << endl;
         return "no _id _index";
@@ -216,24 +218,15 @@ bool DBHashCmd::run(OperationContext* txn,
     return 1;
 }
 
-class DBHashCmd::DBHashLogOpHandler : public RecoveryUnit::Change {
-public:
-    DBHashLogOpHandler(DBHashCmd* dCmd, StringData ns) : _dCmd(dCmd), _ns(ns.toString()) {}
-    void commit() {
-        stdx::lock_guard<stdx::mutex> lk(_dCmd->_cachedHashedMutex);
-        _dCmd->_cachedHashed.erase(_ns);
-    }
-    void rollback() {}
-
-private:
-    DBHashCmd* _dCmd;
-    const std::string _ns;
-};
-
 void DBHashCmd::wipeCacheForCollection(OperationContext* txn, StringData ns) {
     if (!isCachable(ns))
         return;
-    txn->recoveryUnit()->registerChange(new DBHashLogOpHandler(this, ns));
+
+    std::string nsOwned = ns.toString();
+    txn->recoveryUnit()->onCommit([this, txn, nsOwned] {
+        stdx::lock_guard<stdx::mutex> lk(_cachedHashedMutex);
+        _cachedHashed.erase(nsOwned);
+    });
 }
 
 bool DBHashCmd::isCachable(StringData ns) const {

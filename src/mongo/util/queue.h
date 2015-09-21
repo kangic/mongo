@@ -29,12 +29,11 @@
 
 #pragma once
 
-#include <chrono>
-#include <condition_variable>
-#include <mutex>
 #include <limits>
 #include <queue>
 
+#include "mongo/stdx/chrono.h"
+#include "mongo/stdx/condition_variable.h"
 #include "mongo/base/disallow_copying.h"
 
 namespace mongo {
@@ -59,14 +58,13 @@ class BlockingQueue {
 
 public:
     BlockingQueue()
-        : _maxSize(std::numeric_limits<std::size_t>::max()),
-          _currentSize(0),
-          _getSize(&_getSizeDefault) {}
-    BlockingQueue(size_t size) : _maxSize(size), _currentSize(0), _getSize(&_getSizeDefault) {}
-    BlockingQueue(size_t size, getSizeFunc f) : _maxSize(size), _currentSize(0), _getSize(f) {}
+        : _maxSize(std::numeric_limits<std::size_t>::max()), _getSize(&_getSizeDefault) {}
+    BlockingQueue(size_t size) : _maxSize(size), _getSize(&_getSizeDefault) {}
+    BlockingQueue(size_t size, getSizeFunc f) : _maxSize(size), _getSize(f) {}
 
     void push(T const& t) {
-        std::unique_lock<std::mutex> l(_lock);
+        stdx::unique_lock<stdx::mutex> l(_lock);
+        _clearing = false;
         size_t tSize = _getSize(t);
         while (_currentSize + tSize > _maxSize) {
             _cvNoLongerFull.wait(l);
@@ -77,7 +75,7 @@ public:
     }
 
     bool empty() const {
-        std::lock_guard<std::mutex> l(_lock);
+        stdx::lock_guard<stdx::mutex> l(_lock);
         return _queue.empty();
     }
 
@@ -85,7 +83,7 @@ public:
      * The size as measured by the size function. Default to counting each item
      */
     size_t size() const {
-        std::lock_guard<std::mutex> l(_lock);
+        stdx::lock_guard<stdx::mutex> l(_lock);
         return _currentSize;
     }
 
@@ -100,19 +98,21 @@ public:
      * The number/count of items in the queue ( _queue.size() )
      */
     size_t count() const {
-        std::lock_guard<std::mutex> l(_lock);
+        stdx::lock_guard<stdx::mutex> l(_lock);
         return _queue.size();
     }
 
     void clear() {
-        std::lock_guard<std::mutex> l(_lock);
+        stdx::lock_guard<stdx::mutex> l(_lock);
+        _clearing = true;
         _queue = std::queue<T>();
         _currentSize = 0;
         _cvNoLongerFull.notify_one();
+        _cvNoLongerEmpty.notify_one();
     }
 
     bool tryPop(T& t) {
-        std::lock_guard<std::mutex> l(_lock);
+        stdx::lock_guard<stdx::mutex> l(_lock);
         if (_queue.empty())
             return false;
 
@@ -125,9 +125,13 @@ public:
     }
 
     T blockingPop() {
-        std::unique_lock<std::mutex> l(_lock);
-        while (_queue.empty())
+        stdx::unique_lock<stdx::mutex> l(_lock);
+        _clearing = false;
+        while (_queue.empty() && !_clearing)
             _cvNoLongerEmpty.wait(l);
+        if (_clearing) {
+            return T{};
+        }
 
         T t = _queue.front();
         _queue.pop();
@@ -144,14 +148,18 @@ public:
      * otherwise return false and t won't be changed
      */
     bool blockingPop(T& t, int maxSecondsToWait) {
-        using namespace std::chrono;
+        using namespace stdx::chrono;
         const auto deadline = system_clock::now() + seconds(maxSecondsToWait);
-        std::unique_lock<std::mutex> l(_lock);
-        while (_queue.empty()) {
-            if (std::cv_status::timeout == _cvNoLongerEmpty.wait_until(l, deadline))
+        stdx::unique_lock<stdx::mutex> l(_lock);
+        _clearing = false;
+        while (_queue.empty() && !_clearing) {
+            if (stdx::cv_status::timeout == _cvNoLongerEmpty.wait_until(l, deadline))
                 return false;
         }
 
+        if (_clearing) {
+            return false;
+        }
         t = _queue.front();
         _queue.pop();
         _currentSize -= _getSize(t);
@@ -162,14 +170,17 @@ public:
     // Obviously, this should only be used when you have
     // only one consumer
     bool blockingPeek(T& t, int maxSecondsToWait) {
-        using namespace std::chrono;
+        using namespace stdx::chrono;
         const auto deadline = system_clock::now() + seconds(maxSecondsToWait);
-        std::unique_lock<std::mutex> l(_lock);
-        while (_queue.empty()) {
-            if (std::cv_status::timeout == _cvNoLongerEmpty.wait_until(l, deadline))
+        stdx::unique_lock<stdx::mutex> l(_lock);
+        _clearing = false;
+        while (_queue.empty() && !_clearing) {
+            if (stdx::cv_status::timeout == _cvNoLongerEmpty.wait_until(l, deadline))
                 return false;
         }
-
+        if (_clearing) {
+            return false;
+        }
         t = _queue.front();
         return true;
     }
@@ -177,7 +188,7 @@ public:
     // Obviously, this should only be used when you have
     // only one consumer
     bool peek(T& t) {
-        std::unique_lock<std::mutex> l(_lock);
+        stdx::unique_lock<stdx::mutex> l(_lock);
         if (_queue.empty()) {
             return false;
         }
@@ -187,13 +198,14 @@ public:
     }
 
 private:
-    mutable std::mutex _lock;
+    mutable stdx::mutex _lock;
     std::queue<T> _queue;
     const size_t _maxSize;
-    size_t _currentSize;
+    size_t _currentSize = 0;
     getSizeFunc _getSize;
+    bool _clearing = false;
 
-    std::condition_variable _cvNoLongerFull;
-    std::condition_variable _cvNoLongerEmpty;
+    stdx::condition_variable _cvNoLongerFull;
+    stdx::condition_variable _cvNoLongerEmpty;
 };
 }

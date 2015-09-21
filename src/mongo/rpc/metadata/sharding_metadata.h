@@ -25,6 +25,7 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
+#pragma once
 
 #include "mongo/db/jsobj.h"
 
@@ -34,11 +35,13 @@ class BSONObjBuilder;
 class Status;
 template <typename T>
 class StatusWith;
+
 namespace rpc {
 
 /**
  * This class compromises the reply metadata fields that concern sharding. MongoD attaches
  * this information to a command reply, which MongoS uses to process getLastError.
+ * TODO(spencer): Rename this to ShardingResponseMetadata.
  */
 class ShardingMetadata {
 public:

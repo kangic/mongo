@@ -39,6 +39,29 @@ namespace mongo {
 using std::max;
 using std::string;
 
+namespace {
+
+/**
+ * Adds sort key metadata inside 'member' to 'builder' with field name 'fieldName'.
+ *
+ * Returns a non-OK status if sort key metadata is missing from 'member'.
+ */
+Status addSortKeyMetaProj(StringData fieldName,
+                          const WorkingSetMember& member,
+                          BSONObjBuilder* builder) {
+    if (!member.hasComputed(WSM_SORT_KEY)) {
+        return Status(ErrorCodes::InternalError,
+                      "sortKey meta-projection requested but no data available");
+    }
+
+    const SortKeyComputedData* sortKeyData =
+        static_cast<const SortKeyComputedData*>(member.getComputed(WSM_SORT_KEY));
+    builder->append(fieldName, sortKeyData->getSortKey());
+    return Status::OK();
+}
+
+}  // namespace
+
 ProjectionExec::ProjectionExec()
     : _include(true),
       _special(false),
@@ -50,7 +73,6 @@ ProjectionExec::ProjectionExec()
       _hasDottedField(false),
       _queryExpression(NULL),
       _hasReturnKey(false) {}
-
 
 ProjectionExec::ProjectionExec(const BSONObj& spec,
                                const MatchExpression* queryExpression,
@@ -113,17 +135,21 @@ ProjectionExec::ProjectionExec(const BSONObj& spec,
                 BSONObj elemMatchObj = e.wrap();
                 verify(elemMatchObj.isOwned());
                 _elemMatchObjs.push_back(elemMatchObj);
-                StatusWithMatchExpression swme =
+                StatusWithMatchExpression statusWithMatcher =
                     MatchExpressionParser::parse(elemMatchObj, whereCallback);
-                verify(swme.isOK());
+                verify(statusWithMatcher.isOK());
                 // And store it in _matchers.
-                _matchers[mongoutils::str::before(e.fieldName(), '.').c_str()] = swme.getValue();
+                _matchers[mongoutils::str::before(e.fieldName(), '.').c_str()] =
+                    statusWithMatcher.getValue().release();
 
                 add(e.fieldName(), true);
             } else if (mongoutils::str::equals(e2.fieldName(), "$meta")) {
                 verify(String == e2.type());
                 if (e2.valuestr() == LiteParsedQuery::metaTextScore) {
                     _meta[e.fieldName()] = META_TEXT_SCORE;
+                } else if (e2.valuestr() == LiteParsedQuery::metaSortKey) {
+                    _sortKeyMetaFields.push_back(e.fieldName());
+                    _meta[_sortKeyMetaFields.back()] = META_SORT_KEY;
                 } else if (e2.valuestr() == LiteParsedQuery::metaRecordId) {
                     _meta[e.fieldName()] = META_RECORDID;
                 } else if (e2.valuestr() == LiteParsedQuery::metaGeoNearPoint) {
@@ -132,8 +158,6 @@ ProjectionExec::ProjectionExec(const BSONObj& spec,
                     _meta[e.fieldName()] = META_GEONEAR_DIST;
                 } else if (e2.valuestr() == LiteParsedQuery::metaIndexKey) {
                     _hasReturnKey = true;
-                    // The index key clobbers everything so just stop parsing here.
-                    return;
                 } else {
                     // This shouldn't happen, should be caught by parsing.
                     verify(0);
@@ -223,18 +247,27 @@ void ProjectionExec::add(const string& field, int skip, int limit) {
 
 Status ProjectionExec::transform(WorkingSetMember* member) const {
     if (_hasReturnKey) {
-        BSONObj keyObj;
+        BSONObjBuilder builder;
 
         if (member->hasComputed(WSM_INDEX_KEY)) {
             const IndexKeyComputedData* key =
                 static_cast<const IndexKeyComputedData*>(member->getComputed(WSM_INDEX_KEY));
-            keyObj = key->getKey();
+            builder.appendElements(key->getKey());
         }
 
-        member->state = WorkingSetMember::OWNED_OBJ;
-        member->obj = Snapshotted<BSONObj>(SnapshotId(), keyObj);
+        // Must be possible to do both returnKey meta-projection and sortKey meta-projection so that
+        // mongos can support returnKey.
+        for (auto fieldName : _sortKeyMetaFields) {
+            auto sortKeyMetaStatus = addSortKeyMetaProj(fieldName, *member, &builder);
+            if (!sortKeyMetaStatus.isOK()) {
+                return sortKeyMetaStatus;
+            }
+        }
+
+        member->obj = Snapshotted<BSONObj>(SnapshotId(), builder.obj());
         member->keyData.clear();
         member->loc = RecordId();
+        member->transitionToOwnedObj();
         return Status::OK();
     }
 
@@ -312,16 +345,21 @@ Status ProjectionExec::transform(WorkingSetMember* member) const {
             } else {
                 bob.append(it->first, 0.0);
             }
+        } else if (META_SORT_KEY == it->second) {
+            auto sortKeyMetaStatus = addSortKeyMetaProj(it->first, *member, &bob);
+            if (!sortKeyMetaStatus.isOK()) {
+                return sortKeyMetaStatus;
+            }
         } else if (META_RECORDID == it->second) {
             bob.append(it->first, static_cast<long long>(member->loc.repr()));
         }
     }
 
     BSONObj newObj = bob.obj();
-    member->state = WorkingSetMember::OWNED_OBJ;
     member->obj = Snapshotted<BSONObj>(SnapshotId(), newObj);
     member->keyData.clear();
     member->loc = RecordId();
+    member->transitionToOwnedObj();
 
     return Status::OK();
 }

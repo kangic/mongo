@@ -54,12 +54,15 @@ enum WireVersion {
     BATCH_COMMANDS = 2,
 
     // support SCRAM-SHA1, listIndexes, listCollections, new explain
-    RELEASE_2_7_7 = 3
+    RELEASE_2_7_7 = 3,
+
+    // Support find and getMore commands, as well as OP_COMMAND in mongod (but not mongos).
+    FIND_COMMAND = 4,
 };
 
 // Latest version that the server accepts. This should always be at the latest entry in
 // WireVersion.
-static const int maxWireVersion = RELEASE_2_7_7;
+static const int maxWireVersion = FIND_COMMAND;
 
 // Minimum version that the server accepts. We should bump this whenever we don't want
 // to allow communication with too old agents.

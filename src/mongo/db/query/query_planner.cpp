@@ -35,6 +35,7 @@
 #include <vector>
 
 #include "mongo/client/dbclientinterface.h"  // For QueryOption_foobar
+#include "mongo/db/matcher/expression_algo.h"
 #include "mongo/db/matcher/expression_geo.h"
 #include "mongo/db/matcher/expression_text.h"
 #include "mongo/db/query/canonical_query.h"
@@ -370,7 +371,7 @@ Status QueryPlanner::planFromCache(const CanonicalQuery& query,
     // cases, and we proceed by using the PlanCacheIndexTree to tag the query tree.
 
     // Create a copy of the expression tree.  We use cachedSoln to annotate this with indices.
-    MatchExpression* clone = query.root()->shallowClone();
+    unique_ptr<MatchExpression> clone = query.root()->shallowClone();
 
     LOG(5) << "Tagging the match expression according to cache data: " << endl
            << "Filter:" << endl
@@ -387,20 +388,20 @@ Status QueryPlanner::planFromCache(const CanonicalQuery& query,
         LOG(5) << "Index " << i << ": " << ie.keyPattern.toString() << endl;
     }
 
-    Status s = tagAccordingToCache(clone, winnerCacheData.tree.get(), indexMap);
+    Status s = tagAccordingToCache(clone.get(), winnerCacheData.tree.get(), indexMap);
     if (!s.isOK()) {
         return s;
     }
 
     // The planner requires a defined sort order.
-    sortUsingTags(clone);
+    sortUsingTags(clone.get());
 
     LOG(5) << "Tagged tree:" << endl
            << clone->toString();
 
-    // Use the cached index assignments to build solnRoot.  Takes ownership of clone.
-    QuerySolutionNode* solnRoot =
-        QueryPlannerAccess::buildIndexedDataAccess(query, clone, false, params.indices, params);
+    // Use the cached index assignments to build solnRoot.
+    QuerySolutionNode* solnRoot = QueryPlannerAccess::buildIndexedDataAccess(
+        query, clone.release(), false, params.indices, params);
 
     if (!solnRoot) {
         return Status(ErrorCodes::BadValue,
@@ -435,15 +436,16 @@ Status QueryPlanner::plan(const CanonicalQuery& query,
         LOG(5) << "Index " << i << " is " << params.indices[i].toString() << endl;
     }
 
-    bool canTableScan = !(params.options & QueryPlannerParams::NO_TABLE_SCAN);
+    const bool canTableScan = !(params.options & QueryPlannerParams::NO_TABLE_SCAN);
+    const bool isTailable = query.getParsed().isTailable();
 
     // If the query requests a tailable cursor, the only solution is a collscan + filter with
     // tailable set on the collscan.  TODO: This is a policy departure.  Previously I think you
     // could ask for a tailable cursor and it just tried to give you one.  Now, we fail if we
     // can't provide one.  Is this what we want?
-    if (query.getParsed().isTailable()) {
+    if (isTailable) {
         if (!QueryPlannerCommon::hasNode(query.root(), MatchExpression::GEO_NEAR) && canTableScan) {
-            QuerySolution* soln = buildCollscanSoln(query, true, params);
+            QuerySolution* soln = buildCollscanSoln(query, isTailable, params);
             if (NULL != soln) {
                 out->push_back(soln);
             }
@@ -467,7 +469,7 @@ Status QueryPlanner::plan(const CanonicalQuery& query,
             // min/max are incompatible with $natural.
             if (canTableScan && query.getParsed().getMin().isEmpty() &&
                 query.getParsed().getMax().isEmpty()) {
-                QuerySolution* soln = buildCollscanSoln(query, false, params);
+                QuerySolution* soln = buildCollscanSoln(query, isTailable, params);
                 if (NULL != soln) {
                     out->push_back(soln);
                 }
@@ -496,14 +498,30 @@ Status QueryPlanner::plan(const CanonicalQuery& query,
         hintIndex = query.getParsed().getHint();
     }
 
-    // Snapshot is a form of a hint.  If snapshot is set, try to use _id index to make a real
-    // plan.  If that fails, just scan the _id index.
-    if (query.getParsed().isSnapshot()) {
-        // Find the ID index in indexKeyPatterns.  It's our hint.
-        for (size_t i = 0; i < params.indices.size(); ++i) {
-            if (isIdIndex(params.indices[i].keyPattern)) {
-                hintIndex = params.indices[i].keyPattern;
-                break;
+    // If snapshot is set, default to collscanning. If the query param SNAPSHOT_USE_ID is set,
+    // snapshot is a form of a hint, so try to use _id index to make a real plan. If that fails,
+    // just scan the _id index.
+    //
+    // Don't do this if the query is a geonear or text as as text search queries must be answered
+    // using full text indices and geoNear queries must be answered using geospatial indices.
+    if (query.getParsed().isSnapshot() &&
+        !QueryPlannerCommon::hasNode(query.root(), MatchExpression::GEO_NEAR) &&
+        !QueryPlannerCommon::hasNode(query.root(), MatchExpression::TEXT)) {
+        const bool useIXScan = params.options & QueryPlannerParams::SNAPSHOT_USE_ID;
+
+        if (!useIXScan) {
+            QuerySolution* soln = buildCollscanSoln(query, isTailable, params);
+            if (soln) {
+                out->push_back(soln);
+            }
+            return Status::OK();
+        } else {
+            // Find the ID index in indexKeyPatterns. It's our hint.
+            for (size_t i = 0; i < params.indices.size(); ++i) {
+                if (isIdIndex(params.indices[i].keyPattern)) {
+                    hintIndex = params.indices[i].keyPattern;
+                    break;
+                }
             }
         }
     }
@@ -661,11 +679,11 @@ Status QueryPlanner::plan(const CanonicalQuery& query,
            << query.root()->toString();
 
     // If there is a GEO_NEAR it must have an index it can use directly.
-    MatchExpression* gnNode = NULL;
+    const MatchExpression* gnNode = NULL;
     if (QueryPlannerCommon::hasNode(query.root(), MatchExpression::GEO_NEAR, &gnNode)) {
         // No index for GEO_NEAR?  No query.
         RelevantTag* tag = static_cast<RelevantTag*>(gnNode->getTag());
-        if (0 == tag->first.size() && 0 == tag->notFirst.size()) {
+        if (!tag || (0 == tag->first.size() && 0 == tag->notFirst.size())) {
             LOG(5) << "Unable to find index for $geoNear query." << endl;
             // Don't leave tags on query tree.
             query.root()->resetTag();
@@ -676,7 +694,7 @@ Status QueryPlanner::plan(const CanonicalQuery& query,
     }
 
     // Likewise, if there is a TEXT it must have an index it can use directly.
-    MatchExpression* textNode = NULL;
+    const MatchExpression* textNode = NULL;
     if (QueryPlannerCommon::hasNode(query.root(), MatchExpression::TEXT, &textNode)) {
         RelevantTag* tag = static_cast<RelevantTag*>(textNode->getTag());
 
@@ -814,15 +832,9 @@ Status QueryPlanner::plan(const CanonicalQuery& query,
         if (!usingIndexToSort) {
             for (size_t i = 0; i < params.indices.size(); ++i) {
                 const IndexEntry& index = params.indices[i];
-                // Only regular (non-plugin) indexes can be used to provide a sort.
-                if (index.type != INDEX_BTREE) {
-                    continue;
-                }
-                // Only non-sparse indexes can be used to provide a sort.
-                if (index.sparse) {
-                    continue;
-                }
-
+                // Only regular (non-plugin) indexes can be used to provide a sort, and only
+                // non-sparse indexes can be used to provide a sort.
+                //
                 // TODO: Sparse indexes can't normally provide a sort, because non-indexed
                 // documents could potentially be missing from the result set.  However, if the
                 // query predicate can be used to guarantee that all documents to be returned
@@ -834,6 +846,18 @@ Status QueryPlanner::plan(const CanonicalQuery& query,
                 // - Index {a: 1, b: "2dsphere"} (which is "geo-sparse", if
                 //   2dsphereIndexVersion=2) should be able to provide a sort for
                 //   find({b: GEO}).sort({a:1}).  SERVER-10801.
+                if (index.type != INDEX_BTREE) {
+                    continue;
+                }
+                if (index.sparse) {
+                    continue;
+                }
+
+                // Partial indexes can only be used to provide a sort only if the query predicate is
+                // compatible.
+                if (index.filterExpr && !expression::isSubsetOf(query.root(), index.filterExpr)) {
+                    continue;
+                }
 
                 const BSONObj kp = QueryPlannerAnalysis::getSortPattern(index.keyPattern);
                 if (providesSort(query, kp)) {
@@ -886,7 +910,7 @@ Status QueryPlanner::plan(const CanonicalQuery& query,
     bool collscanNeeded = (0 == out->size() && canTableScan);
 
     if (possibleToCollscan && (collscanRequested || collscanNeeded)) {
-        QuerySolution* collscan = buildCollscanSoln(query, false, params);
+        QuerySolution* collscan = buildCollscanSoln(query, isTailable, params);
         if (NULL != collscan) {
             SolutionCacheData* scd = new SolutionCacheData();
             scd->solnType = SolutionCacheData::COLLSCAN_SOLN;

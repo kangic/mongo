@@ -47,7 +47,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/max_time.h"
-#include "mongo/db/server_parameters.h"
+#include "mongo/s/query/cluster_cursor_cleanup_job.h"
 #include "mongo/util/concurrency/task.h"
 #include "mongo/util/log.h"
 #include "mongo/util/net/listen.h"
@@ -138,7 +138,7 @@ long long ShardedClientCursor::idleTime(long long now) {
     return now - _lastAccessMillis;
 }
 
-bool ShardedClientCursor::sendNextBatch(int ntoreturn, BufBuilder& buffer, int& docCount) {
+bool ShardedClientCursor::sendNextBatch(int batchSize, BufBuilder& buffer, int& docCount) {
     uassert(10191, "cursor already done", !_done);
 
     int maxSize = 1024 * 1024;
@@ -147,44 +147,47 @@ bool ShardedClientCursor::sendNextBatch(int ntoreturn, BufBuilder& buffer, int& 
 
     docCount = 0;
 
-    // If ntoreturn is negative, it means that we should send up to -ntoreturn results
-    // back to the client, and that we should only send a *single batch*. An ntoreturn of
+    // If batchSize is negative, it means that we should send up to -batchSize results
+    // back to the client, and that we should only send a *single batch*. An batchSize of
     // 1 is also a special case which means "return up to 1 result in a single batch" (so
-    // that +1 actually has the same meaning of -1). For all other values of ntoreturn, we
+    // that +1 actually has the same meaning of -1). For all other values of batchSize, we
     // may have to return multiple batches.
-    const bool sendMoreBatches = ntoreturn == 0 || ntoreturn > 1;
-    ntoreturn = abs(ntoreturn);
+    const bool sendMoreBatches = batchSize == 0 || batchSize > 1;
+    batchSize = abs(batchSize);
+
+    // Set the initial batch size to 101, just like mongoD.
+    if (batchSize == 0 && _totalSent == 0)
+        batchSize = 101;
+
+    // Set batch size to batchSize requested by the current operation unconditionally.  This is
+    // necessary because if the loop exited due to docCount == batchSize then setBatchSize(0) was
+    // called, so the next _cusor->more() will be called with a batch size of 0 if the cursor
+    // buffer was drained the previous run.  Unconditionally setting the batch size ensures that
+    // we don't ask for a batch size of zero as a side effect.
+    _cursor->setBatchSize(batchSize);
 
     bool cursorHasMore = true;
     while ((cursorHasMore = _cursor->more())) {
         BSONObj o = _cursor->next();
-
         buffer.appendBuf((void*)o.objdata(), o.objsize());
-        docCount++;
+        ++docCount;
+
         // Ensure that the next batch will never wind up requesting more docs from the shard
-        // than are remaining to satisfy the initial ntoreturn.
-        if (ntoreturn != 0) {
-            _cursor->setBatchSize(ntoreturn - docCount);
+        // than are remaining to satisfy the initial batchSize.
+        if (batchSize != 0) {
+            if (docCount == batchSize)
+                break;
+            _cursor->setBatchSize(batchSize - docCount);
         }
 
         if (buffer.len() > maxSize) {
-            break;
-        }
-
-        if (docCount == ntoreturn) {
-            // soft limit aka batch size
-            break;
-        }
-
-        if (ntoreturn == 0 && _totalSent == 0 && docCount >= 100) {
-            // first batch should be max 100 unless batch size specified
             break;
         }
     }
 
     // We need to request another batch if the following two conditions hold:
     //
-    //  1. ntoreturn is positive and not equal to 1 (see the comment above). This condition
+    //  1. batchSize is positive and not equal to 1 (see the comment above). This condition
     //  is stored in 'sendMoreBatches'.
     //
     //  2. The last call to _cursor->more() was true (i.e. we never explicitly got a false
@@ -202,7 +205,7 @@ bool ShardedClientCursor::sendNextBatch(int ntoreturn, BufBuilder& buffer, int& 
     bool hasMoreBatches = sendMoreBatches && cursorHasMore;
 
     LOG(5) << "\t hasMoreBatches: " << hasMoreBatches << " sendMoreBatches: " << sendMoreBatches
-           << " cursorHasMore: " << cursorHasMore << " ntoreturn: " << ntoreturn
+           << " cursorHasMore: " << cursorHasMore << " batchSize: " << batchSize
            << " num: " << docCount << " id:" << getId() << " totalSent: " << _totalSent << endl;
 
     _totalSent += docCount;
@@ -212,10 +215,6 @@ bool ShardedClientCursor::sendNextBatch(int ntoreturn, BufBuilder& buffer, int& 
 }
 
 // ---- CursorCache -----
-
-long long CursorCache::TIMEOUT = 10 * 60 * 1000 /* 10 minutes */;
-ExportedServerParameter<long long> cursorCacheTimeoutConfig(
-    ServerParameterSet::getGlobal(), "cursorTimeoutMillis", &CursorCache::TIMEOUT, true, true);
 
 unsigned getCCRandomSeed() {
     unique_ptr<SecureRandom> sr(SecureRandom::create());
@@ -449,7 +448,7 @@ void CursorCache::doTimeouts() {
     for (MapSharded::iterator i = _cursors.begin(); i != _cursors.end(); ++i) {
         // Note: cursors with no timeout will always have an idleTime of 0
         long long idleFor = i->second->idleTime(now);
-        if (idleFor < TIMEOUT) {
+        if (idleFor < ClusterCursorCleanupJob::cursorTimeoutMillis) {
             continue;
         }
         log() << "killing old cursor " << i->second->getId() << " idle for: " << idleFor << "ms"
@@ -479,36 +478,4 @@ public:
 void CursorCache::startTimeoutThread() {
     task::repeat(new CursorTimeoutTask, 4000);
 }
-
-class CmdCursorInfo : public Command {
-public:
-    CmdCursorInfo() : Command("cursorInfo") {}
-    virtual bool slaveOk() const {
-        return true;
-    }
-    virtual void help(stringstream& help) const {
-        help << " example: { cursorInfo : 1 }";
-    }
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
-        ActionSet actions;
-        actions.addAction(ActionType::cursorInfo);
-        out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
-    }
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
-    }
-    bool run(OperationContext* txn,
-             const string&,
-             BSONObj& jsobj,
-             int,
-             string& errmsg,
-             BSONObjBuilder& result) {
-        cursorCache.appendInfo(result);
-        if (jsobj["setTimeout"].isNumber())
-            CursorCache::TIMEOUT = jsobj["setTimeout"].numberLong();
-        return true;
-    }
-} cmdCursorInfo;
-}
+}  // namespace mongo

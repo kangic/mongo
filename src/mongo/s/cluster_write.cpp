@@ -111,12 +111,12 @@ void toBatchError(const Status& status, BatchedCommandResponse* response) {
 /**
  * Splits the chunks touched based from the targeter stats if needed.
  */
-void splitIfNeeded(const NamespaceString& nss, const TargeterStats& stats) {
+void splitIfNeeded(OperationContext* txn, const NamespaceString& nss, const TargeterStats& stats) {
     if (!Chunk::ShouldAutoSplit) {
         return;
     }
 
-    auto status = grid.catalogCache()->getDatabase(nss.db().toString());
+    auto status = grid.catalogCache()->getDatabase(txn, nss.db().toString());
     if (!status.isOK()) {
         warning() << "failed to get database config for " << nss
                   << " while checking for auto-split: " << status.getStatus();
@@ -126,8 +126,8 @@ void splitIfNeeded(const NamespaceString& nss, const TargeterStats& stats) {
     shared_ptr<DBConfig> config = status.getValue();
 
     ChunkManagerPtr chunkManager;
-    ShardPtr dummyShard;
-    config->getChunkManagerOrPrimary(nss, chunkManager, dummyShard);
+    shared_ptr<Shard> dummyShard;
+    config->getChunkManagerOrPrimary(txn, nss.ns(), chunkManager, dummyShard);
 
     if (!chunkManager) {
         return;
@@ -138,19 +138,20 @@ void splitIfNeeded(const NamespaceString& nss, const TargeterStats& stats) {
          ++it) {
         ChunkPtr chunk;
         try {
-            chunk = chunkManager->findIntersectingChunk(it->first);
+            chunk = chunkManager->findIntersectingChunk(txn, it->first);
         } catch (const AssertionException& ex) {
             warning() << "could not find chunk while checking for auto-split: " << causedBy(ex);
             return;
         }
 
-        chunk->splitIfShould(it->second);
+        chunk->splitIfShould(txn, it->second);
     }
 }
 
 }  // namespace
 
-Status clusterCreateIndex(const string& ns,
+Status clusterCreateIndex(OperationContext* txn,
+                          const string& ns,
                           BSONObj keys,
                           bool unique,
                           BatchedCommandResponse* response) {
@@ -164,7 +165,7 @@ Status clusterCreateIndex(const string& ns,
     insert->addToDocuments(indexDoc);
 
     BatchedCommandRequest request(insert.release());
-    request.setNS(nss.getSystemIndexesCollection());
+    request.setNS(NamespaceString(nss.getSystemIndexesCollection()));
     request.setWriteConcern(WriteConcernOptions::Acknowledged);
 
     BatchedCommandResponse dummyResponse;
@@ -173,7 +174,7 @@ Status clusterCreateIndex(const string& ns,
     }
 
     ClusterWriter writer(false, 0);
-    writer.write(request, response);
+    writer.write(txn, request, response);
 
     if (response->getOk() != 1) {
         return Status(static_cast<ErrorCodes::Error>(response->getErrCode()),
@@ -198,13 +199,14 @@ Status clusterCreateIndex(const string& ns,
 }
 
 
-void ClusterWriter::write(const BatchedCommandRequest& origRequest,
+void ClusterWriter::write(OperationContext* txn,
+                          const BatchedCommandRequest& origRequest,
                           BatchedCommandResponse* response) {
     // Add _ids to insert request if req'd
     unique_ptr<BatchedCommandRequest> idRequest(BatchedCommandRequest::cloneWithIds(origRequest));
     const BatchedCommandRequest& request = NULL != idRequest.get() ? *idRequest : origRequest;
 
-    const NamespaceString& nss = request.getNSS();
+    const NamespaceString& nss = request.getNS();
     if (!nss.isValid()) {
         toBatchError(Status(ErrorCodes::InvalidNamespace, nss.ns() + " is not a valid namespace"),
                      response);
@@ -242,10 +244,10 @@ void ClusterWriter::write(const BatchedCommandRequest& origRequest,
     const string dbName = nss.db().toString();
 
     if (dbName == "config" || dbName == "admin") {
-        grid.catalogManager()->writeConfigServerDirect(request, response);
+        grid.catalogManager(txn)->writeConfigServerDirect(txn, request, response);
     } else {
         ChunkManagerTargeter targeter(request.getTargetingNSS());
-        Status targetInitStatus = targeter.init();
+        Status targetInitStatus = targeter.init(txn);
 
         if (!targetInitStatus.isOK()) {
             // Errors will be reported in response if we are unable to target
@@ -257,10 +259,10 @@ void ClusterWriter::write(const BatchedCommandRequest& origRequest,
         DBClientShardResolver resolver;
         DBClientMultiCommand dispatcher;
         BatchWriteExec exec(&targeter, &resolver, &dispatcher);
-        exec.executeBatch(request, response);
+        exec.executeBatch(txn, request, response);
 
         if (_autoSplit) {
-            splitIfNeeded(request.getNSS(), *targeter.getStats());
+            splitIfNeeded(txn, request.getNS(), *targeter.getStats());
         }
 
         _stats->setShardStats(exec.releaseStats());

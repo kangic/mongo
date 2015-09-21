@@ -402,7 +402,8 @@ connection_runtime_config = [
             to close''', min=0),
         Config('close_idle_time', '30', r'''
             amount of time in seconds a file handle needs to be idle
-            before attempting to close it''', min=1, max=100000),
+            before attempting to close it. A setting of 0 means that idle
+            handles are not closed''', min=0, max=100000),
         Config('close_scan_interval', '10', r'''
             interval in seconds at which to check for files that are
             inactive and close them''', min=1, max=100000),
@@ -448,13 +449,17 @@ connection_runtime_config = [
         Config('chunk', '10MB', r'''
             the granularity that a shared cache is redistributed''',
             min='1MB', max='10TB'),
+        Config('name', 'none', r'''
+            the name of a cache that is shared between databases or
+            \c "none" when no shared cache is configured'''),
+        Config('quota', '0', r'''
+            maximum size of cache this database can be allocated from the
+            shared cache. Defaults to the entire shared cache size''',
+            type='int'),
         Config('reserve', '0', r'''
             amount of cache this database is guaranteed to have
             available from the shared cache. This setting is per
             database. Defaults to the chunk size''', type='int'),
-        Config('name', 'none', r'''
-            the name of a cache that is shared between databases or
-            \c "none" when no shared cache is configured'''),
         Config('size', '500MB', r'''
             maximum memory to allocate for the shared cache. Setting
             this will update the value if one is already set''',
@@ -656,7 +661,7 @@ common_wiredtiger_open = [
         Config('enabled', 'false', r'''
             whether to sync the log on every commit by default, can be
             overridden by the \c sync setting to
-            WT_SESSION::begin_transaction''',
+            WT_SESSION::commit_transaction''',
             type='boolean'),
         Config('method', 'fsync', r'''
             the method used to ensure log records are stable on disk, see
@@ -718,6 +723,17 @@ methods = {
     Config('remove_files', 'true', r'''
         should the underlying files be removed?''',
         type='boolean'),
+]),
+
+'WT_SESSION.log_flush' : Method([
+    Config('sync', 'on', r'''
+        forcibly flush the log and wait for it to achieve the synchronization
+        level specified.  The \c background setting initiates a background
+        synchronization intended to be used with a later call to
+        WT_SESSION::transaction_sync.  The \c off setting forces any
+        buffered log records to be written to the file system.  The
+        \c on setting forces log records to be written to the storage device''',
+        choices=['background', 'off', 'on']),
 ]),
 
 'WT_SESSION.log_printf' : Method([]),
@@ -797,6 +813,7 @@ methods = {
 ]),
 
 'WT_SESSION.rename' : Method([]),
+'WT_SESSION.reset' : Method([]),
 'WT_SESSION.salvage' : Method([
     Config('force', 'false', r'''
         force salvage even of files that do not appear to be WiredTiger
@@ -805,10 +822,10 @@ methods = {
 ]),
 'WT_SESSION.strerror' : Method([]),
 'WT_SESSION.transaction_sync' : Method([
-    Config('timeout_ms', '', r'''
+    Config('timeout_ms', '1200000', r'''
         maximum amount of time to wait for background sync to complete in
         milliseconds.  A value of zero disables the timeout and returns
-        immediately.  The default waits forever.''',
+        immediately.''',
         type='int'),
 ]),
 
@@ -865,7 +882,12 @@ methods = {
 'WT_SESSION.commit_transaction' : Method([
     Config('sync', '', r'''
         override whether to sync log records when the transaction commits,
-        inherited from ::wiredtiger_open \c transaction_sync''',
+        inherited from ::wiredtiger_open \c transaction_sync.
+        The \c background setting initiates a background
+        synchronization intended to be used with a later call to
+        WT_SESSION::transaction_sync.  The \c off setting does not
+        wait for record to be written or synchronized.  The
+        \c on setting forces log records to be written to the storage device''',
         choices=['background', 'off', 'on']),
 ]),
 'WT_SESSION.rollback_transaction' : Method([]),
@@ -979,8 +1001,10 @@ methods = {
     connection_runtime_config +
     common_wiredtiger_open + [
     Config('config_base', 'true', r'''
-        write the base configuration file if creating the database,
-        see @ref config_base for more information''',
+        write the base configuration file if creating the database.  If
+        \c false in the config passed directly to ::wiredtiger_open, will
+        ignore any existing base configuration file in addition to not creating
+        one.  See @ref config_base for more information''',
         type='boolean'),
     Config('create', 'false', r'''
         create the database if it does not exist''',
@@ -1009,8 +1033,10 @@ methods = {
     connection_runtime_config +
     common_wiredtiger_open + [
     Config('config_base', 'true', r'''
-        write the base configuration file if creating the database,
-        see @ref config_base for more information''',
+        write the base configuration file if creating the database.  If
+        \c false in the config passed directly to ::wiredtiger_open, will
+        ignore any existing base configuration file in addition to not creating
+        one.  See @ref config_base for more information''',
         type='boolean'),
     Config('create', 'false', r'''
         create the database if it does not exist''',

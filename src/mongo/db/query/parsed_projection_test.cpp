@@ -46,9 +46,9 @@ using namespace mongo;
 //
 
 unique_ptr<ParsedProjection> createParsedProjection(const BSONObj& query, const BSONObj& projObj) {
-    StatusWithMatchExpression swme = MatchExpressionParser::parse(query);
-    ASSERT(swme.isOK());
-    std::unique_ptr<MatchExpression> queryMatchExpr(swme.getValue());
+    StatusWithMatchExpression statusWithMatcher = MatchExpressionParser::parse(query);
+    ASSERT(statusWithMatcher.isOK());
+    std::unique_ptr<MatchExpression> queryMatchExpr = std::move(statusWithMatcher.getValue());
     ParsedProjection* out = NULL;
     Status status = ParsedProjection::make(projObj, queryMatchExpr.get(), &out);
     if (!status.isOK()) {
@@ -72,9 +72,9 @@ unique_ptr<ParsedProjection> createParsedProjection(const char* queryStr, const 
 void assertInvalidProjection(const char* queryStr, const char* projStr) {
     BSONObj query = fromjson(queryStr);
     BSONObj projObj = fromjson(projStr);
-    StatusWithMatchExpression swme = MatchExpressionParser::parse(query);
-    ASSERT(swme.isOK());
-    std::unique_ptr<MatchExpression> queryMatchExpr(swme.getValue());
+    StatusWithMatchExpression statusWithMatcher = MatchExpressionParser::parse(query);
+    ASSERT(statusWithMatcher.isOK());
+    std::unique_ptr<MatchExpression> queryMatchExpr = std::move(statusWithMatcher.getValue());
     ParsedProjection* out = NULL;
     Status status = ParsedProjection::make(projObj, queryMatchExpr.get(), &out);
     std::unique_ptr<ParsedProjection> destroy(out);
@@ -189,6 +189,30 @@ TEST(ParsedProjectionTest, InvalidPositionalProjectionDefaultPathMatchExpression
     BSONObj emptyFieldProjObj = fromjson("{'.$': 1}");
     status = ParsedProjection::make(emptyFieldProjObj, queryMatchExpr.get(), &out);
     ASSERT(!status.isOK());
+}
+
+TEST(ParsedProjectionTest, ParsedProjectionDefaults) {
+    auto parsedProjection = createParsedProjection("{}", "{}");
+
+    ASSERT_FALSE(parsedProjection->wantSortKey());
+    ASSERT_TRUE(parsedProjection->requiresDocument());
+    ASSERT_FALSE(parsedProjection->requiresMatchDetails());
+    ASSERT_FALSE(parsedProjection->wantGeoNearDistance());
+    ASSERT_FALSE(parsedProjection->wantGeoNearPoint());
+    ASSERT_FALSE(parsedProjection->wantIndexKey());
+}
+
+TEST(ParsedProjectionTest, SortKeyMetaProjection) {
+    auto parsedProjection = createParsedProjection("{}", "{foo: {$meta: 'sortKey'}}");
+
+    ASSERT_EQ(parsedProjection->getProjObj(), fromjson("{foo: {$meta: 'sortKey'}}"));
+    ASSERT_TRUE(parsedProjection->wantSortKey());
+    ASSERT_TRUE(parsedProjection->requiresDocument());
+
+    ASSERT_FALSE(parsedProjection->requiresMatchDetails());
+    ASSERT_FALSE(parsedProjection->wantGeoNearDistance());
+    ASSERT_FALSE(parsedProjection->wantGeoNearPoint());
+    ASSERT_FALSE(parsedProjection->wantIndexKey());
 }
 
 //

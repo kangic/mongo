@@ -32,8 +32,8 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/bson/util/bson_extract.h"
 #include "mongo/client/connpool.h"
-#include "mongo/client/parallel.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_manager.h"
@@ -56,6 +56,7 @@
 #include "mongo/s/commands/run_on_all_shards_cmd.h"
 #include "mongo/s/config.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/query/store_possible_cursor.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/s/version_manager.h"
 #include "mongo/scripting/engine.h"
@@ -100,25 +101,36 @@ public:
     }
 
 protected:
-    bool passthrough(DBConfigPtr conf, const BSONObj& cmdObj, BSONObjBuilder& result) {
-        return _passthrough(conf->name(), conf, cmdObj, 0, result);
+    bool passthrough(OperationContext* txn,
+                     shared_ptr<DBConfig> conf,
+                     const BSONObj& cmdObj,
+                     BSONObjBuilder& result) {
+        return _passthrough(txn, conf->name(), conf, cmdObj, 0, result);
     }
 
-    bool adminPassthrough(DBConfigPtr conf, const BSONObj& cmdObj, BSONObjBuilder& result) {
-        return _passthrough("admin", conf, cmdObj, 0, result);
+    bool adminPassthrough(OperationContext* txn,
+                          shared_ptr<DBConfig> conf,
+                          const BSONObj& cmdObj,
+                          BSONObjBuilder& result) {
+        return _passthrough(txn, "admin", conf, cmdObj, 0, result);
     }
 
-    bool passthrough(DBConfigPtr conf, const BSONObj& cmdObj, int options, BSONObjBuilder& result) {
-        return _passthrough(conf->name(), conf, cmdObj, options, result);
+    bool passthrough(OperationContext* txn,
+                     shared_ptr<DBConfig> conf,
+                     const BSONObj& cmdObj,
+                     int options,
+                     BSONObjBuilder& result) {
+        return _passthrough(txn, conf->name(), conf, cmdObj, options, result);
     }
 
 private:
-    bool _passthrough(const string& db,
-                      DBConfigPtr conf,
+    bool _passthrough(OperationContext* txn,
+                      const string& db,
+                      shared_ptr<DBConfig> conf,
                       const BSONObj& cmdObj,
                       int options,
                       BSONObjBuilder& result) {
-        const auto shard = grid.shardRegistry()->getShard(conf->getPrimaryId());
+        const auto shard = grid.shardRegistry()->getShard(txn, conf->getPrimaryId());
         ShardConnection conn(shard->getConnString(), "");
 
         BSONObj res;
@@ -138,16 +150,19 @@ public:
                                bool implicitCreateDb = false)
         : RunOnAllShardsCommand(n, oldname, useShardConn, implicitCreateDb) {}
 
-    virtual void getShardIds(const string& dbName, BSONObj& cmdObj, vector<ShardId>& shardIds) {
+    virtual void getShardIds(OperationContext* txn,
+                             const string& dbName,
+                             BSONObj& cmdObj,
+                             vector<ShardId>& shardIds) {
         const string fullns = dbName + '.' + cmdObj.firstElement().valuestrsafe();
 
-        auto status = grid.catalogCache()->getDatabase(dbName);
+        auto status = grid.catalogCache()->getDatabase(txn, dbName);
         uassertStatusOK(status.getStatus());
 
         shared_ptr<DBConfig> conf = status.getValue();
 
         if (!conf->isShardingEnabled() || !conf->isSharded(fullns)) {
-            shardIds.push_back(conf->getShardId(fullns));
+            shardIds.push_back(conf->getShardId(txn, fullns));
         } else {
             grid.shardRegistry()->getAllShardIds(&shardIds);
         }
@@ -167,9 +182,9 @@ public:
                      BSONObjBuilder& result) {
         const string fullns = parseNs(dbName, cmdObj);
 
-        auto conf = uassertStatusOK(grid.catalogCache()->getDatabase(dbName));
+        auto conf = uassertStatusOK(grid.catalogCache()->getDatabase(txn, dbName));
         if (!conf->isSharded(fullns)) {
-            return passthrough(conf, cmdObj, options, result);
+            return passthrough(txn, conf, cmdObj, options, result);
         }
 
         return appendCommandStatus(
@@ -392,14 +407,14 @@ public:
              int,
              string& errmsg,
              BSONObjBuilder& result) {
-        auto status = grid.implicitCreateDb(dbName);
+        auto status = grid.implicitCreateDb(txn, dbName);
         if (!status.isOK()) {
             return appendCommandStatus(result, status.getStatus());
         }
 
         shared_ptr<DBConfig> conf = status.getValue();
 
-        return passthrough(conf, cmdObj, result);
+        return passthrough(txn, conf, cmdObj, result);
     }
 
 } createCmd;
@@ -421,7 +436,7 @@ public:
              int options,
              string& errmsg,
              BSONObjBuilder& result) {
-        auto status = grid.catalogCache()->getDatabase(dbName);
+        auto status = grid.catalogCache()->getDatabase(txn, dbName);
         if (!status.isOK()) {
             if (status == ErrorCodes::DatabaseNotFound) {
                 return true;
@@ -430,39 +445,24 @@ public:
             return appendCommandStatus(result, status.getStatus());
         }
 
-        shared_ptr<DBConfig> conf = status.getValue();
-
         const string fullns = dbName + "." + cmdObj.firstElement().valuestrsafe();
+
         log() << "DROP: " << fullns;
 
-        if (!conf->isShardingEnabled() || !conf->isSharded(fullns)) {
+        const auto& db = status.getValue();
+        if (!db->isShardingEnabled() || !db->isSharded(fullns)) {
             log() << "\tdrop going to do passthrough";
-            return passthrough(conf, cmdObj, result);
+            return passthrough(txn, db, cmdObj, result);
         }
 
-        //
-        // TODO: There will be problems if we simultaneously shard and drop a collection
-        //
+        uassertStatusOK(grid.catalogManager(txn)->dropCollection(txn, NamespaceString(fullns)));
 
-        ChunkManagerPtr cm;
-        ShardPtr primary;
-        conf->getChunkManagerOrPrimary(fullns, cm, primary);
+        // Force a full reload next time the just dropped namespace is accessed
+        db->invalidateNs(fullns);
 
-        if (!cm) {
-            log() << "\tdrop going to do passthrough after re-check";
-            return passthrough(conf, cmdObj, result);
-        }
-
-        uassertStatusOK(grid.catalogManager()->dropCollection(fullns));
-
-        if (!conf->removeSharding(fullns)) {
-            warning() << "collection " << fullns
-                      << " was reloaded as unsharded before drop completed"
-                      << " during single drop";
-        }
-
-        return 1;
+        return true;
     }
+
 } dropCmd;
 
 class RenameCollectionCmd : public PublicGridCommand {
@@ -484,23 +484,23 @@ public:
              BSONObjBuilder& result) {
         const string fullnsFrom = cmdObj.firstElement().valuestrsafe();
         const string dbNameFrom = nsToDatabase(fullnsFrom);
-        auto confFrom = uassertStatusOK(grid.catalogCache()->getDatabase(dbNameFrom));
+        auto confFrom = uassertStatusOK(grid.catalogCache()->getDatabase(txn, dbNameFrom));
 
         const string fullnsTo = cmdObj["to"].valuestrsafe();
         const string dbNameTo = nsToDatabase(fullnsTo);
-        auto confTo = uassertStatusOK(grid.catalogCache()->getDatabase(dbNameTo));
+        auto confTo = uassertStatusOK(grid.catalogCache()->getDatabase(txn, dbNameTo));
 
         uassert(13138, "You can't rename a sharded collection", !confFrom->isSharded(fullnsFrom));
         uassert(13139, "You can't rename to a sharded collection", !confTo->isSharded(fullnsTo));
 
-        const ShardId& shardTo = confTo->getShardId(fullnsTo);
-        const ShardId& shardFrom = confFrom->getShardId(fullnsFrom);
+        const ShardId& shardTo = confTo->getShardId(txn, fullnsTo);
+        const ShardId& shardFrom = confFrom->getShardId(txn, fullnsFrom);
 
         uassert(13137,
                 "Source and destination collections must be on same shard",
                 shardFrom == shardTo);
 
-        return adminPassthrough(confFrom, cmdObj, result);
+        return adminPassthrough(txn, confFrom, cmdObj, result);
     }
 } renameCollectionCmd;
 
@@ -526,20 +526,20 @@ public:
         uassert(ErrorCodes::EmptyFieldName, "missing todb argument", !todb.empty());
         uassert(ErrorCodes::InvalidNamespace, "invalid todb argument", nsIsDbOnly(todb));
 
-        auto confTo = uassertStatusOK(grid.implicitCreateDb(todb));
+        auto confTo = uassertStatusOK(grid.implicitCreateDb(txn, todb));
         uassert(ErrorCodes::IllegalOperation,
                 "cannot copy to a sharded database",
                 !confTo->isShardingEnabled());
 
         const string fromhost = cmdObj.getStringField("fromhost");
         if (!fromhost.empty()) {
-            return adminPassthrough(confTo, cmdObj, result);
+            return adminPassthrough(txn, confTo, cmdObj, result);
         } else {
             const string fromdb = cmdObj.getStringField("fromdb");
             uassert(13399, "need a fromdb argument", !fromdb.empty());
 
             shared_ptr<DBConfig> confFrom =
-                uassertStatusOK(grid.catalogCache()->getDatabase(fromdb));
+                uassertStatusOK(grid.catalogCache()->getDatabase(txn, fromdb));
 
             uassert(13400, "don't know where source DB is", confFrom);
             uassert(13401, "cant copy from sharded DB", !confFrom->isShardingEnabled());
@@ -552,12 +552,12 @@ public:
             }
 
             {
-                const auto& shard = grid.shardRegistry()->getShard(confFrom->getPrimaryId());
+                const auto& shard = grid.shardRegistry()->getShard(txn, confFrom->getPrimaryId());
                 b.append("fromhost", shard->getConnString().toString());
             }
             BSONObj fixed = b.obj();
 
-            return adminPassthrough(confTo, fixed, result);
+            return adminPassthrough(txn, confTo, fixed, result);
         }
     }
 
@@ -582,17 +582,17 @@ public:
              BSONObjBuilder& result) {
         const string fullns = parseNs(dbName, cmdObj);
 
-        auto conf = uassertStatusOK(grid.catalogCache()->getDatabase(dbName));
+        auto conf = uassertStatusOK(grid.catalogCache()->getDatabase(txn, dbName));
         if (!conf->isShardingEnabled() || !conf->isSharded(fullns)) {
             result.appendBool("sharded", false);
             result.append("primary", conf->getPrimaryId());
 
-            return passthrough(conf, cmdObj, result);
+            return passthrough(txn, conf, cmdObj, result);
         }
 
         result.appendBool("sharded", true);
 
-        ChunkManagerPtr cm = conf->getChunkManager(fullns);
+        ChunkManagerPtr cm = conf->getChunkManager(txn, fullns);
         massert(12594, "how could chunk manager be null!", cm);
 
         BSONObjBuilder shardStats;
@@ -610,7 +610,7 @@ public:
         cm->getAllShardIds(&shardIds);
 
         for (const ShardId& shardId : shardIds) {
-            const auto shard = grid.shardRegistry()->getShard(shardId);
+            const auto shard = grid.shardRegistry()->getShard(txn, shardId);
             if (!shard) {
                 continue;
             }
@@ -728,6 +728,9 @@ public:
 class DataSizeCmd : public PublicGridCommand {
 public:
     DataSizeCmd() : PublicGridCommand("dataSize", "datasize") {}
+    virtual string parseNs(const string& dbname, const BSONObj& cmdObj) const override {
+        return parseNsFullyQualified(dbname, cmdObj);
+    }
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
                                        std::vector<Privilege>* out) {
@@ -743,12 +746,12 @@ public:
              BSONObjBuilder& result) {
         const string fullns = parseNs(dbName, cmdObj);
 
-        auto conf = uassertStatusOK(grid.catalogCache()->getDatabase(dbName));
+        auto conf = uassertStatusOK(grid.catalogCache()->getDatabase(txn, dbName));
         if (!conf->isShardingEnabled() || !conf->isSharded(fullns)) {
-            return passthrough(conf, cmdObj, result);
+            return passthrough(txn, conf, cmdObj, result);
         }
 
-        ChunkManagerPtr cm = conf->getChunkManager(fullns);
+        ChunkManagerPtr cm = conf->getChunkManager(txn, fullns);
         massert(13407, "how could chunk manager be null!", cm);
 
         BSONObj min = cmdObj.getObjectField("min");
@@ -776,7 +779,7 @@ public:
         set<ShardId> shardIds;
         cm->getShardIdsForRange(shardIds, min, max);
         for (const ShardId& shardId : shardIds) {
-            const auto shard = grid.shardRegistry()->getShard(shardId);
+            const auto shard = grid.shardRegistry()->getShard(txn, shardId);
             if (!shard) {
                 continue;
             }
@@ -841,18 +844,21 @@ public:
                    const std::string& dbname,
                    const BSONObj& cmdObj,
                    ExplainCommon::Verbosity verbosity,
+                   const rpc::ServerSelectionMetadata& serverSelectionMetadata,
                    BSONObjBuilder* out) const {
         const string fullns = parseNs(dbname, cmdObj);
 
         BSONObjBuilder explainCmdBob;
-        ClusterExplain::wrapAsExplain(cmdObj, verbosity, &explainCmdBob);
+        int options = 0;
+        ClusterExplain::wrapAsExplain(
+            cmdObj, verbosity, serverSelectionMetadata, &explainCmdBob, &options);
 
         // We will time how long it takes to run the commands on the shards.
         Timer timer;
 
         Strategy::CommandResult singleResult;
-        Status commandStat =
-            Strategy::commandOpUnsharded(dbname, explainCmdBob.obj(), 0, fullns, &singleResult);
+        Status commandStat = Strategy::commandOpUnsharded(
+            txn, dbname, explainCmdBob.obj(), options, fullns, &singleResult);
         if (!commandStat.isOK()) {
             return commandStat;
         }
@@ -863,7 +869,7 @@ public:
         shardResults.push_back(singleResult);
 
         return ClusterExplain::buildExplainResult(
-            shardResults, ClusterExplain::kSingleShard, millisElapsed, out);
+            txn, shardResults, ClusterExplain::kSingleShard, millisElapsed, out);
     }
 
 } groupCmd;
@@ -903,7 +909,6 @@ public:
 
 } splitVectorCmd;
 
-
 class DistinctCmd : public PublicGridCommand {
 public:
     DistinctCmd() : PublicGridCommand("distinct") {}
@@ -929,17 +934,17 @@ public:
              BSONObjBuilder& result) {
         const string fullns = parseNs(dbName, cmdObj);
 
-        auto status = grid.catalogCache()->getDatabase(dbName);
+        auto status = grid.catalogCache()->getDatabase(txn, dbName);
         if (!status.isOK()) {
             return appendEmptyResultSet(result, status.getStatus(), fullns);
         }
 
         shared_ptr<DBConfig> conf = status.getValue();
         if (!conf->isShardingEnabled() || !conf->isSharded(fullns)) {
-            return passthrough(conf, cmdObj, options, result);
+            return passthrough(txn, conf, cmdObj, options, result);
         }
 
-        ChunkManagerPtr cm = conf->getChunkManager(fullns);
+        ChunkManagerPtr cm = conf->getChunkManager(txn, fullns);
         massert(10420, "how could chunk manager be null!", cm);
 
         BSONObj query = getQuery(cmdObj);
@@ -950,7 +955,7 @@ public:
         int size = 32;
 
         for (const ShardId& shardId : shardIds) {
-            const auto shard = grid.shardRegistry()->getShard(shardId);
+            const auto shard = grid.shardRegistry()->getShard(txn, shardId);
             if (!shard) {
                 continue;
             }
@@ -983,6 +988,48 @@ public:
         result.appendArray("values", b.obj());
         return true;
     }
+
+    Status explain(OperationContext* txn,
+                   const std::string& dbname,
+                   const BSONObj& cmdObj,
+                   ExplainCommon::Verbosity verbosity,
+                   const rpc::ServerSelectionMetadata& serverSelectionMetadata,
+                   BSONObjBuilder* out) const {
+        const string fullns = parseNs(dbname, cmdObj);
+
+        // Extract the targeting query.
+        BSONObj targetingQuery;
+        if (BSONElement queryElt = cmdObj["query"]) {
+            if (queryElt.type() == BSONType::Object) {
+                targetingQuery = queryElt.embeddedObject();
+            } else if (queryElt.type() != BSONType::jstNULL) {
+                return Status(ErrorCodes::TypeMismatch,
+                              str::stream() << "\"query\" had the wrong type. Expected "
+                                            << typeName(BSONType::Object) << " or "
+                                            << typeName(BSONType::jstNULL) << ", found "
+                                            << typeName(queryElt.type()));
+            }
+        }
+
+        BSONObjBuilder explainCmdBob;
+        int options = 0;
+        ClusterExplain::wrapAsExplain(
+            cmdObj, verbosity, serverSelectionMetadata, &explainCmdBob, &options);
+
+        // We will time how long it takes to run the commands on the shards.
+        Timer timer;
+
+        vector<Strategy::CommandResult> shardResults;
+        Strategy::commandOp(
+            txn, dbname, explainCmdBob.obj(), options, fullns, targetingQuery, &shardResults);
+
+        long long millisElapsed = timer.millis();
+
+        const char* mongosStageName = ClusterExplain::getStageNameForReadOp(shardResults, cmdObj);
+
+        return ClusterExplain::buildExplainResult(
+            txn, shardResults, mongosStageName, millisElapsed, out);
+    }
 } disinctCmd;
 
 class FileMD5Cmd : public PublicGridCommand {
@@ -1014,18 +1061,18 @@ public:
              BSONObjBuilder& result) {
         const string fullns = parseNs(dbName, cmdObj);
 
-        auto conf = uassertStatusOK(grid.catalogCache()->getDatabase(dbName));
+        auto conf = uassertStatusOK(grid.catalogCache()->getDatabase(txn, dbName));
         if (!conf->isShardingEnabled() || !conf->isSharded(fullns)) {
-            return passthrough(conf, cmdObj, result);
+            return passthrough(txn, conf, cmdObj, result);
         }
 
-        ChunkManagerPtr cm = conf->getChunkManager(fullns);
+        ChunkManagerPtr cm = conf->getChunkManager(txn, fullns);
         massert(13091, "how could chunk manager be null!", cm);
         if (cm->getShardKeyPattern().toBSON() == BSON("files_id" << 1)) {
             BSONObj finder = BSON("files_id" << cmdObj.firstElement());
 
             vector<Strategy::CommandResult> results;
-            Strategy::commandOp(dbName, cmdObj, 0, fullns, finder, &results);
+            Strategy::commandOp(txn, dbName, cmdObj, 0, fullns, finder, &results);
             verify(results.size() == 1);  // querying on shard key so should only talk to one shard
             BSONObj res = results.begin()->result;
 
@@ -1057,7 +1104,7 @@ public:
 
                 vector<Strategy::CommandResult> results;
                 try {
-                    Strategy::commandOp(dbName, shardCmd, 0, fullns, finder, &results);
+                    Strategy::commandOp(txn, dbName, shardCmd, 0, fullns, finder, &results);
                 } catch (DBException& e) {
                     // This is handled below and logged
                     Strategy::CommandResult errResult;
@@ -1142,12 +1189,12 @@ public:
              BSONObjBuilder& result) {
         const string fullns = parseNs(dbName, cmdObj);
 
-        auto conf = uassertStatusOK(grid.catalogCache()->getDatabase(dbName));
+        auto conf = uassertStatusOK(grid.catalogCache()->getDatabase(txn, dbName));
         if (!conf->isShardingEnabled() || !conf->isSharded(fullns)) {
-            return passthrough(conf, cmdObj, options, result);
+            return passthrough(txn, conf, cmdObj, options, result);
         }
 
-        ChunkManagerPtr cm = conf->getChunkManager(fullns);
+        ChunkManagerPtr cm = conf->getChunkManager(txn, fullns);
         massert(13500, "how could chunk manager be null!", cm);
 
         BSONObj query = getQuery(cmdObj);
@@ -1163,7 +1210,7 @@ public:
         list<shared_ptr<Future::CommandResult>> futures;
         BSONArrayBuilder shardArray;
         for (const ShardId& shardId : shardIds) {
-            const auto shard = grid.shardRegistry()->getShard(shardId);
+            const auto shard = grid.shardRegistry()->getShard(txn, shardId);
             if (!shard) {
                 continue;
             }
@@ -1183,7 +1230,7 @@ public:
              i != futures.end();
              i++) {
             shared_ptr<Future::CommandResult> res = *i;
-            if (!res->join()) {
+            if (!res->join(txn)) {
                 errmsg = res->result()["errmsg"].String();
                 if (res->result().hasField("code")) {
                     result.append(res->result()["code"]);
@@ -1308,13 +1355,13 @@ public:
 
         // $eval isn't allowed to access sharded collections, but we need to leave the
         // shard to detect that.
-        auto status = grid.catalogCache()->getDatabase(dbName);
+        auto status = grid.catalogCache()->getDatabase(txn, dbName);
         if (!status.isOK()) {
             return appendCommandStatus(result, status.getStatus());
         }
 
         shared_ptr<DBConfig> conf = status.getValue();
-        return passthrough(conf, cmdObj, result);
+        return passthrough(txn, conf, cmdObj, result);
     }
 } evalCmd;
 
@@ -1347,21 +1394,25 @@ public:
              int,
              string& errmsg,
              BSONObjBuilder& result) {
-        auto status = grid.catalogCache()->getDatabase(dbName);
-        if (!status.isOK()) {
-            return appendEmptyResultSet(
-                result, status.getStatus(), dbName + ".$cmd.listCollections");
+        auto conf = grid.catalogCache()->getDatabase(txn, dbName);
+        if (!conf.isOK()) {
+            return appendEmptyResultSet(result, conf.getStatus(), dbName + ".$cmd.listCollections");
         }
 
-        shared_ptr<DBConfig> conf = status.getValue();
-        bool retval = passthrough(conf, cmdObj, result);
+        BSONObjBuilder shardResponseBuilder;
+        bool retval = passthrough(txn, conf.getValue(), cmdObj, shardResponseBuilder);
+        BSONObj shardResponse = shardResponseBuilder.obj();
 
-        const auto shard = grid.shardRegistry()->getShard(conf->getPrimaryId());
-        Status storeCursorStatus =
-            storePossibleCursor(shard->getConnString().toString(), result.asTempObj());
-        if (!storeCursorStatus.isOK()) {
-            return appendCommandStatus(result, storeCursorStatus);
+        const auto shard = grid.shardRegistry()->getShard(txn, conf.getValue()->getPrimaryId());
+        StatusWith<BSONObj> transformedResponse =
+            storePossibleCursor(shard->getConnString().toString(),
+                                shardResponse,
+                                grid.shardRegistry()->getExecutor(),
+                                grid.getCursorManager());
+        if (!transformedResponse.isOK()) {
+            return appendCommandStatus(result, transformedResponse.getStatus());
         }
+        result.appendElements(transformedResponse.getValue());
 
         return retval;
     }
@@ -1385,15 +1436,25 @@ public:
              int options,
              string& errmsg,
              BSONObjBuilder& result) {
-        auto conf = uassertStatusOK(grid.catalogCache()->getDatabase(dbName));
-        bool retval = passthrough(conf, cmdObj, result);
-
-        const auto shard = grid.shardRegistry()->getShard(conf->getPrimaryId());
-        Status storeCursorStatus =
-            storePossibleCursor(shard->getConnString().toString(), result.asTempObj());
-        if (!storeCursorStatus.isOK()) {
-            return appendCommandStatus(result, storeCursorStatus);
+        auto conf = grid.catalogCache()->getDatabase(txn, dbName);
+        if (!conf.isOK()) {
+            return appendCommandStatus(result, conf.getStatus());
         }
+
+        BSONObjBuilder shardResponseBuilder;
+        bool retval = passthrough(txn, conf.getValue(), cmdObj, shardResponseBuilder);
+        BSONObj shardResponse = shardResponseBuilder.obj();
+
+        const auto shard = grid.shardRegistry()->getShard(txn, conf.getValue()->getPrimaryId());
+        StatusWith<BSONObj> transformedResponse =
+            storePossibleCursor(shard->getConnString().toString(),
+                                shardResponse,
+                                grid.shardRegistry()->getExecutor(),
+                                grid.getCursorManager());
+        if (!transformedResponse.isOK()) {
+            return appendCommandStatus(result, transformedResponse.getStatus());
+        }
+        result.appendElements(transformedResponse.getValue());
 
         return retval;
     }

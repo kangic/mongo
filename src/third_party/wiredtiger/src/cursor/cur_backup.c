@@ -210,16 +210,16 @@ __backup_start(
 	 * The hot backup copy is done outside of WiredTiger, which means file
 	 * blocks can't be freed and re-allocated until the backup completes.
 	 * The checkpoint code checks the backup flag, and if a backup cursor
-	 * is open checkpoints aren't discarded.   We release the lock as soon
+	 * is open checkpoints aren't discarded. We release the lock as soon
 	 * as we've set the flag, we don't want to block checkpoints, we just
 	 * want to make sure no checkpoints are deleted.  The checkpoint code
 	 * holds the lock until it's finished the checkpoint, otherwise we
 	 * could start a hot backup that would race with an already-started
 	 * checkpoint.
 	 */
-	__wt_spin_lock(session, &conn->hot_backup_lock);
+	WT_RET(__wt_writelock(session, conn->hot_backup_lock));
 	conn->hot_backup = 1;
-	__wt_spin_unlock(session, &conn->hot_backup_lock);
+	WT_ERR(__wt_writeunlock(session, conn->hot_backup_lock));
 
 	/* Create the hot backup file. */
 	WT_ERR(__backup_file_create(session, cb, 0));
@@ -318,9 +318,9 @@ __backup_stop(WT_SESSION_IMPL *session)
 	ret = __wt_backup_file_remove(session);
 
 	/* Checkpoint deletion can proceed, as can the next hot backup. */
-	__wt_spin_lock(session, &conn->hot_backup_lock);
+	WT_TRET(__wt_writelock(session, conn->hot_backup_lock));
 	conn->hot_backup = 0;
-	__wt_spin_unlock(session, &conn->hot_backup_lock);
+	WT_TRET(__wt_writeunlock(session, conn->hot_backup_lock));
 
 	return (ret);
 }
@@ -514,17 +514,23 @@ static int
 __backup_list_all_append(WT_SESSION_IMPL *session, const char *cfg[])
 {
 	WT_CURSOR_BACKUP *cb;
+	const char *name;
 
 	WT_UNUSED(cfg);
 
 	cb = session->bkp_cursor;
+	name = session->dhandle->name;
 
 	/* Ignore files in the process of being bulk-loaded. */
 	if (F_ISSET(S2BT(session), WT_BTREE_BULK))
 		return (0);
 
+	/* Ignore the lookaside table. */
+	if (strcmp(name, WT_LAS_URI) == 0)
+		return (0);
+
 	/* Add the file to the list of files to be copied. */
-	return (__backup_list_append(session, cb, session->dhandle->name));
+	return (__backup_list_append(session, cb, name));
 }
 
 /*

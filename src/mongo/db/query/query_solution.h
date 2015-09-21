@@ -28,6 +28,7 @@
 
 #pragma once
 
+#include <memory>
 
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression.h"
@@ -140,7 +141,7 @@ struct QuerySolutionNode {
             other->children.push_back(this->children[i]->clone());
         }
         if (NULL != this->filter) {
-            other->filter.reset(this->filter->shallowClone());
+            other->filter = this->filter->shallowClone();
         }
     }
 
@@ -227,8 +228,7 @@ struct TextNode : public QuerySolutionNode {
 
     virtual void appendToString(mongoutils::str::stream* ss, int indent) const;
 
-    // Text's return is LOC_AND_UNOWNED_OBJ or LOC_AND_OWNED_OBJ so it's fetched and has all
-    // fields.
+    // Text's return is LOC_AND_OBJ so it's fetched and has all fields.
     bool fetched() const {
         return true;
     }
@@ -250,6 +250,7 @@ struct TextNode : public QuerySolutionNode {
     std::string query;
     std::string language;
     bool caseSensitive;
+    bool diacriticSensitive;
 
     // "Prefix" fields of a text index can handle equality predicates.  We group them with the
     // text node while creating the text leaf node and convert them into a BSONObj index prefix
@@ -459,6 +460,8 @@ struct IndexScanNode : public QuerySolutionNode {
 
     QuerySolutionNode* clone() const;
 
+    bool operator==(const IndexScanNode& other) const;
+
     BSONObjSet _sorts;
 
     BSONObj indexKeyPattern;
@@ -560,6 +563,39 @@ struct ProjectionNode : public QuerySolutionNode {
     BSONObj coveredKeyObj;
 };
 
+struct SortKeyGeneratorNode : public QuerySolutionNode {
+    StageType getType() const final {
+        return STAGE_SORT_KEY_GENERATOR;
+    }
+
+    bool fetched() const final {
+        return children[0]->fetched();
+    }
+
+    bool hasField(const std::string& field) const final {
+        return children[0]->hasField(field);
+    }
+
+    bool sortedByDiskLoc() const final {
+        return children[0]->sortedByDiskLoc();
+    }
+
+    const BSONObjSet& getSort() const final {
+        return children[0]->getSort();
+    }
+
+    QuerySolutionNode* clone() const final;
+
+    void appendToString(mongoutils::str::stream* ss, int indent) const final;
+
+    // The query predicate provided by the user. For sorted by an array field, the sort key depends
+    // on the predicate.
+    BSONObj queryObj;
+
+    // The user-supplied sort pattern.
+    BSONObj sortSpec;
+};
+
 struct SortNode : public QuerySolutionNode {
     SortNode() : limit(0) {}
     virtual ~SortNode() {}
@@ -598,8 +634,6 @@ struct SortNode : public QuerySolutionNode {
 
     BSONObj pattern;
 
-    BSONObj query;
-
     // Sum of both limit and skip count in the parsed query.
     size_t limit;
 };
@@ -629,7 +663,7 @@ struct LimitNode : public QuerySolutionNode {
 
     QuerySolutionNode* clone() const;
 
-    int limit;
+    long long limit;
 };
 
 struct SkipNode : public QuerySolutionNode {
@@ -656,7 +690,7 @@ struct SkipNode : public QuerySolutionNode {
 
     QuerySolutionNode* clone() const;
 
-    int skip;
+    long long skip;
 };
 
 // This is a standalone stage.

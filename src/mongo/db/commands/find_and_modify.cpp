@@ -38,6 +38,7 @@
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
@@ -96,12 +97,22 @@ const DeleteStats* getDeleteStats(const PlanStageStats* stats) {
  *
  * If the operation failed, then an error Status is returned.
  */
-StatusWith<boost::optional<BSONObj>> advanceExecutor(PlanExecutor* exec, bool isRemove) {
+StatusWith<boost::optional<BSONObj>> advanceExecutor(OperationContext* txn,
+                                                     PlanExecutor* exec,
+                                                     bool isRemove,
+                                                     Collection* collection) {
     BSONObj value;
     PlanExecutor::ExecState state = exec->getNext(&value, nullptr);
+    if (collection && PlanExecutor::DEAD != state) {
+        PlanSummaryStats summaryStats;
+        Explain::getSummaryStats(*exec, &summaryStats);
+        collection->infoCache()->notifyOfQuery(txn, summaryStats.indexesUsed);
+    }
+
     if (PlanExecutor::ADVANCED == state) {
         return boost::optional<BSONObj>(std::move(value));
     }
+
     if (PlanExecutor::FAILURE == state || PlanExecutor::DEAD == state) {
         const std::unique_ptr<PlanStageStats> stats(exec->getStats());
         error() << "Plan executor error during findAndModify: " << PlanExecutor::statestr(state)
@@ -117,6 +128,7 @@ StatusWith<boost::optional<BSONObj>> advanceExecutor(PlanExecutor* exec, bool is
                 str::stream() << "executor returned " << PlanExecutor::statestr(state)
                               << " while executing " << opstr};
     }
+
     invariant(state == PlanExecutor::IS_EOF);
     return boost::optional<BSONObj>(boost::none);
 }
@@ -217,6 +229,7 @@ public:
                    const std::string& dbName,
                    const BSONObj& cmdObj,
                    ExplainCommon::Verbosity verbosity,
+                   const rpc::ServerSelectionMetadata&,
                    BSONObjBuilder* out) const override {
         const std::string fullNs = parseNsCollectionRequired(dbName, cmdObj);
         Status allowedWriteStatus = userAllowedWriteNS(fullNs);
@@ -232,8 +245,6 @@ public:
 
         const FindAndModifyRequest& args = parseStatus.getValue();
         const NamespaceString& nsString = args.getNamespaceString();
-
-        auto client = txn->getClient();
 
         if (args.isRemove()) {
             DeleteRequest request(nsString);
@@ -251,7 +262,7 @@ public:
             AutoGetDb autoDb(txn, dbName, MODE_IX);
             Lock::CollectionLock collLock(txn->lockState(), nsString.ns(), MODE_IX);
 
-            ensureShardVersionOKOrThrow(client, nsString.ns());
+            ensureShardVersionOKOrThrow(txn, nsString.ns());
 
             Collection* collection = nullptr;
             if (autoDb.getDb()) {
@@ -261,12 +272,11 @@ public:
                         str::stream() << "database " << dbName << " does not exist."};
             }
 
-            PlanExecutor* rawExec;
-            Status execStatus = getExecutorDelete(txn, collection, &parsedDelete, &rawExec);
-            if (!execStatus.isOK()) {
-                return execStatus;
+            auto statusWithPlanExecutor = getExecutorDelete(txn, collection, &parsedDelete);
+            if (!statusWithPlanExecutor.isOK()) {
+                return statusWithPlanExecutor.getStatus();
             }
-            const std::unique_ptr<PlanExecutor> exec(rawExec);
+            const std::unique_ptr<PlanExecutor> exec = std::move(statusWithPlanExecutor.getValue());
             Explain::explainStages(exec.get(), verbosity, out);
         } else {
             UpdateRequest request(nsString);
@@ -288,7 +298,7 @@ public:
             AutoGetDb autoDb(txn, dbName, MODE_IX);
             Lock::CollectionLock collLock(txn->lockState(), nsString.ns(), MODE_IX);
 
-            ensureShardVersionOKOrThrow(client, nsString.ns());
+            ensureShardVersionOKOrThrow(txn, nsString.ns());
 
             Collection* collection = nullptr;
             if (autoDb.getDb()) {
@@ -298,13 +308,12 @@ public:
                         str::stream() << "database " << dbName << " does not exist."};
             }
 
-            PlanExecutor* rawExec;
-            Status execStatus =
-                getExecutorUpdate(txn, collection, &parsedUpdate, opDebug, &rawExec);
-            if (!execStatus.isOK()) {
-                return execStatus;
+            auto statusWithPlanExecutor =
+                getExecutorUpdate(txn, collection, &parsedUpdate, opDebug);
+            if (!statusWithPlanExecutor.isOK()) {
+                return statusWithPlanExecutor.getStatus();
             }
-            const std::unique_ptr<PlanExecutor> exec(rawExec);
+            const std::unique_ptr<PlanExecutor> exec = std::move(statusWithPlanExecutor.getValue());
             Explain::explainStages(exec.get(), verbosity, out);
         }
 
@@ -346,6 +355,7 @@ public:
             maybeDisableValidation.emplace(txn);
 
         auto client = txn->getClient();
+        auto lastOpAtOperationStart = repl::ReplClientInfo::forClient(client).getLastOp();
 
         // We may encounter a WriteConflictException when creating a collection during an
         // upsert, even when holding the exclusive lock on the database (due to other load on
@@ -371,22 +381,22 @@ public:
                 Lock::CollectionLock collLock(txn->lockState(), nsString.ns(), MODE_IX);
                 Collection* collection = autoDb.getDb()->getCollection(nsString.ns());
 
-                ensureShardVersionOKOrThrow(client, nsString.ns());
+                ensureShardVersionOKOrThrow(txn, nsString.ns());
 
                 Status isPrimary = checkCanAcceptWritesForDatabase(nsString);
                 if (!isPrimary.isOK()) {
                     return appendCommandStatus(result, isPrimary);
                 }
 
-                PlanExecutor* rawExec;
-                Status execStatus = getExecutorDelete(txn, collection, &parsedDelete, &rawExec);
-                if (!execStatus.isOK()) {
-                    return appendCommandStatus(result, execStatus);
+                auto statusWithPlanExecutor = getExecutorDelete(txn, collection, &parsedDelete);
+                if (!statusWithPlanExecutor.isOK()) {
+                    return appendCommandStatus(result, statusWithPlanExecutor.getStatus());
                 }
-                const std::unique_ptr<PlanExecutor> exec(rawExec);
+                const std::unique_ptr<PlanExecutor> exec =
+                    std::move(statusWithPlanExecutor.getValue());
 
                 StatusWith<boost::optional<BSONObj>> advanceStatus =
-                    advanceExecutor(exec.get(), args.isRemove());
+                    advanceExecutor(txn, exec.get(), args.isRemove(), collection);
                 if (!advanceStatus.isOK()) {
                     return appendCommandStatus(result, advanceStatus.getStatus());
                 }
@@ -412,7 +422,7 @@ public:
                 Lock::CollectionLock collLock(txn->lockState(), nsString.ns(), MODE_IX);
                 Collection* collection = autoDb.getDb()->getCollection(nsString.ns());
 
-                ensureShardVersionOKOrThrow(client, nsString.ns());
+                ensureShardVersionOKOrThrow(txn, nsString.ns());
 
                 Status isPrimary = checkCanAcceptWritesForDatabase(nsString);
                 if (!isPrimary.isOK()) {
@@ -447,16 +457,16 @@ public:
                     }
                 }
 
-                PlanExecutor* rawExec;
-                Status execStatus =
-                    getExecutorUpdate(txn, collection, &parsedUpdate, opDebug, &rawExec);
-                if (!execStatus.isOK()) {
-                    return appendCommandStatus(result, execStatus);
+                auto statusWithPlanExecutor =
+                    getExecutorUpdate(txn, collection, &parsedUpdate, opDebug);
+                if (!statusWithPlanExecutor.isOK()) {
+                    return appendCommandStatus(result, statusWithPlanExecutor.getStatus());
                 }
-                const std::unique_ptr<PlanExecutor> exec(rawExec);
+                const std::unique_ptr<PlanExecutor> exec =
+                    std::move(statusWithPlanExecutor.getValue());
 
                 StatusWith<boost::optional<BSONObj>> advanceStatus =
-                    advanceExecutor(exec.get(), args.isRemove());
+                    advanceExecutor(txn, exec.get(), args.isRemove(), collection);
                 if (!advanceStatus.isOK()) {
                     return appendCommandStatus(result, advanceStatus.getStatus());
                 }
@@ -466,6 +476,11 @@ public:
             }
         }
         MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "findAndModify", nsString.ns());
+
+        // No-ops need to reset lastOp in the client, for write concern.
+        if (repl::ReplClientInfo::forClient(client).getLastOp() == lastOpAtOperationStart) {
+            repl::ReplClientInfo::forClient(client).setLastOpToSystemLastOpTime(txn);
+        }
 
         WriteConcernResult res;
         auto waitForWCStatus = waitForWriteConcern(

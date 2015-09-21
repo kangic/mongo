@@ -43,12 +43,14 @@
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/dbtests/dbtests.h"
+#include "mongo/stdx/memory.h"
 
 namespace QueryStageFetch {
 
+using std::set;
 using std::shared_ptr;
 using std::unique_ptr;
-using std::set;
+using stdx::make_unique;
 
 class QueryStageFetchBase {
 public:
@@ -107,22 +109,26 @@ public:
         ASSERT_EQUALS(size_t(1), locs.size());
 
         // Create a mock stage that returns the WSM.
-        unique_ptr<QueuedDataStage> mockStage(new QueuedDataStage(&ws));
+        auto mockStage = make_unique<QueuedDataStage>(&_txn, &ws);
 
         // Mock data.
         {
-            WorkingSetMember mockMember;
-            mockMember.state = WorkingSetMember::LOC_AND_UNOWNED_OBJ;
-            mockMember.loc = *locs.begin();
-            mockMember.obj = coll->docFor(&_txn, mockMember.loc);
+            WorkingSetID id = ws.allocate();
+            WorkingSetMember* mockMember = ws.get(id);
+            mockMember->loc = *locs.begin();
+            mockMember->obj = coll->docFor(&_txn, mockMember->loc);
+            ws.transitionToLocAndObj(id);
             // Points into our DB.
-            mockStage->pushBack(mockMember);
-
-            mockMember.state = WorkingSetMember::OWNED_OBJ;
-            mockMember.loc = RecordId();
-            mockMember.obj = Snapshotted<BSONObj>(SnapshotId(), BSON("foo" << 6));
-            ASSERT_TRUE(mockMember.obj.value().isOwned());
-            mockStage->pushBack(mockMember);
+            mockStage->pushBack(id);
+        }
+        {
+            WorkingSetID id = ws.allocate();
+            WorkingSetMember* mockMember = ws.get(id);
+            mockMember->loc = RecordId();
+            mockMember->obj = Snapshotted<BSONObj>(SnapshotId(), BSON("foo" << 6));
+            mockMember->transitionToOwnedObj();
+            ASSERT_TRUE(mockMember->obj.value().isOwned());
+            mockStage->pushBack(id);
         }
 
         unique_ptr<FetchStage> fetchStage(
@@ -169,25 +175,26 @@ public:
         ASSERT_EQUALS(size_t(1), locs.size());
 
         // Create a mock stage that returns the WSM.
-        unique_ptr<QueuedDataStage> mockStage(new QueuedDataStage(&ws));
+        auto mockStage = make_unique<QueuedDataStage>(&_txn, &ws);
 
         // Mock data.
         {
-            WorkingSetMember mockMember;
-            mockMember.state = WorkingSetMember::LOC_AND_IDX;
-            mockMember.loc = *locs.begin();
+            WorkingSetID id = ws.allocate();
+            WorkingSetMember* mockMember = ws.get(id);
+            mockMember->loc = *locs.begin();
+            ws.transitionToLocAndIdx(id);
 
             // State is loc and index, shouldn't be able to get the foo data inside.
             BSONElement elt;
-            ASSERT_FALSE(mockMember.getFieldDotted("foo", &elt));
-            mockStage->pushBack(mockMember);
+            ASSERT_FALSE(mockMember->getFieldDotted("foo", &elt));
+            mockStage->pushBack(id);
         }
 
         // Make the filter.
         BSONObj filterObj = BSON("foo" << 6);
-        StatusWithMatchExpression swme = MatchExpressionParser::parse(filterObj);
-        verify(swme.isOK());
-        unique_ptr<MatchExpression> filterExpr(swme.getValue());
+        StatusWithMatchExpression statusWithMatcher = MatchExpressionParser::parse(filterObj);
+        verify(statusWithMatcher.isOK());
+        unique_ptr<MatchExpression> filterExpr = std::move(statusWithMatcher.getValue());
 
         // Matcher requires that foo==6 but we only have data with foo==5.
         unique_ptr<FetchStage> fetchStage(

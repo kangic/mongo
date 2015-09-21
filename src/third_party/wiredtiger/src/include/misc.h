@@ -130,6 +130,7 @@
 
 #define	FLD_CLR(field, mask)	((field) &= ~((uint32_t)(mask)))
 #define	FLD_ISSET(field, mask)	((field) & ((uint32_t)(mask)))
+#define	FLD64_ISSET(field, mask)	((field) & ((uint64_t)(mask)))
 #define	FLD_SET(field, mask)	((field) |= ((uint32_t)(mask)))
 
 /*
@@ -155,6 +156,24 @@
 			    compare_lt(__v, (arrayp)[__j]); --__j)	\
 				(arrayp)[__j + 1] = (arrayp)[__j];	\
 			(arrayp)[__j + 1] = __v;			\
+		}							\
+	}								\
+} while (0)
+
+/*
+ * Binary search for an integer key.
+ */
+#define	WT_BINARY_SEARCH(key, arrayp, n, found) do {			\
+	uint32_t __base, __indx, __limit;				\
+	found = 0;							\
+	for (__base = 0, __limit = (n); __limit != 0; __limit >>= 1) {	\
+		__indx = __base + (__limit >> 1);			\
+		if ((arrayp)[__indx] < key) {				\
+			__base = __indx + 1;				\
+			--__limit;					\
+		} else if ((arrayp)[__indx] == key) {			\
+			found = 1;					\
+			break;						\
 		}							\
 	}								\
 } while (0)
@@ -237,3 +256,11 @@
 #define	__wt_page_swap(session, held, want, flags)			\
 	__wt_page_swap_func(session, held, want, flags)
 #endif
+
+/* Random number generator state. */
+union __wt_rand_state {
+	uint64_t v;
+	struct {
+		uint32_t w, z;
+	} x;
+};

@@ -18,6 +18,12 @@ var doTest = function(useDollarQuerySyntax) {
     var replTest = st.rs0;
     var primaryNode = replTest.getMaster();
 
+    // The $-prefixed query syntax is only legal for compatibility mode reads, not for the
+    // find/getMore commands.
+    if (useDollarQuerySyntax && st.s.getDB("test").getMongo().useReadCommands()) {
+        return;
+    }
+
     var setupConf = function(){
         var replConf = primaryNode.getDB( 'local' ).system.replset.findOne();
         replConf.version = (replConf.version || 0) + 1;
@@ -93,7 +99,6 @@ var doTest = function(useDollarQuerySyntax) {
         return false;
     });
 
-
     var getExplain = function(readPrefMode, readPrefTags) {
         if (useDollarQuerySyntax) {
             var readPrefObj = {
@@ -115,7 +120,19 @@ var doTest = function(useDollarQuerySyntax) {
     var getExplainServer = function(explain) {
         var serverInfo;
 
-        if (useDollarQuerySyntax) {
+        // TODO: Remove this when SERVER-20194 is resolved. The resolution of this ticket will unify
+        // the formats returned by queries routed through mongos with the $explain flag and explain
+        // commands routed through mongos.
+        var cmdRes = coll.getDB("test").adminCommand({
+            getParameter: 1,
+            useClusterClientCursor: 1
+        });
+        assert.commandWorked(cmdRes);
+        var useCCC = cmdRes.useClusterClientCursor;
+
+        // TODO: Remove the if block and unconditionally use the code in the else block under
+        // SERVER-20194.
+        if (useDollarQuerySyntax && !useCCC) {
             serverInfo = explain.serverInfo;
         }
         else {

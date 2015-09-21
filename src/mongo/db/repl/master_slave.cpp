@@ -269,7 +269,7 @@ void ReplSource::loadAll(OperationContext* txn, SourceVector& v) {
         // add if missing
         int n = 0;
         unique_ptr<PlanExecutor> exec(InternalPlanner::collectionScan(
-            txn, localSources, ctx.db()->getCollection(localSources)));
+            txn, localSources, ctx.db()->getCollection(localSources), PlanExecutor::YIELD_MANUAL));
         BSONObj obj;
         PlanExecutor::ExecState state;
         while (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, NULL))) {
@@ -309,8 +309,8 @@ void ReplSource::loadAll(OperationContext* txn, SourceVector& v) {
         }
     }
 
-    unique_ptr<PlanExecutor> exec(
-        InternalPlanner::collectionScan(txn, localSources, ctx.db()->getCollection(localSources)));
+    unique_ptr<PlanExecutor> exec(InternalPlanner::collectionScan(
+        txn, localSources, ctx.db()->getCollection(localSources), PlanExecutor::YIELD_MANUAL));
     BSONObj obj;
     PlanExecutor::ExecState state;
     while (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, NULL))) {
@@ -480,7 +480,7 @@ void ReplSource::resync(OperationContext* txn, const std::string& dbName) {
         cloneOptions.useReplAuth = true;
         cloneOptions.snapshot = true;
         cloneOptions.mayYield = true;
-        cloneOptions.mayBeInterrupted = false;
+        cloneOptions.mayBeInterrupted = true;
 
         Cloner cloner;
         Status status = cloner.copyDb(txn, db, hostName.c_str(), cloneOptions, NULL);
@@ -1348,12 +1348,14 @@ void startMasterSlave(OperationContext* txn) {
         verify(replSettings.slave == SimpleSlave);
         LOG(1) << "slave=true" << endl;
         stdx::thread repl_thread(replSlaveThread);
+        repl_thread.detach();
     }
 
     if (replSettings.master) {
         LOG(1) << "master=true" << endl;
         createOplog(txn);
         stdx::thread t(replMasterThread);
+        t.detach();
     }
 
     if (replSettings.fastsync) {

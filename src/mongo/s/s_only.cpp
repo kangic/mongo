@@ -39,6 +39,7 @@
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/stats/counters.h"
 #include "mongo/rpc/metadata.h"
 #include "mongo/rpc/reply_builder_interface.h"
 #include "mongo/rpc/request_interface.h"
@@ -117,14 +118,19 @@ void Command::execCommandClientBasic(OperationContext* txn,
 
     c->_commandsExecuted.increment();
 
+    if (c->shouldAffectCommandCounter()) {
+        globalOpCounters.gotCommand();
+    }
+
     std::string errmsg;
-    bool ok;
+    bool ok = false;
     try {
         ok = c->run(txn, dbname, cmdObj, queryOptions, errmsg, result);
     } catch (const DBException& e) {
-        ok = false;
-        int code = e.getCode();
-        if (code == RecvStaleConfigCode) {  // code for StaleConfigException
+        const int code = e.getCode();
+
+        // Codes for StaleConfigException
+        if (code == RecvStaleConfigCode || code == SendStaleConfigCode) {
             throw;
         }
 
@@ -139,7 +145,8 @@ void Command::execCommandClientBasic(OperationContext* txn,
     appendCommandStatus(result, ok, errmsg);
 }
 
-void Command::runAgainstRegistered(const char* ns,
+void Command::runAgainstRegistered(OperationContext* txn,
+                                   const char* ns,
                                    BSONObj& jsobj,
                                    BSONObjBuilder& anObjBuilder,
                                    int queryOptions) {
@@ -160,8 +167,7 @@ void Command::runAgainstRegistered(const char* ns,
         return;
     }
 
-    auto txn = cc().makeOperationContext();
-    execCommandClientBasic(txn.get(), c, cc(), queryOptions, ns, jsobj, anObjBuilder);
+    execCommandClientBasic(txn, c, cc(), queryOptions, ns, jsobj, anObjBuilder);
 }
 
 void Command::registerError(OperationContext* txn, const DBException& exception) {}

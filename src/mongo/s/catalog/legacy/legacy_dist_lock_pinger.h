@@ -51,6 +51,8 @@ public:
 
     /**
      * Starts pinging the process id for the given lock.
+     * Note: this pinger does not support calling startPing on a lock that has previously
+     * been stopped by a call to stopPing on its underlying processId.
      */
     Status startPing(const DistributedLock& lock, Milliseconds sleepTime);
 
@@ -74,7 +76,7 @@ public:
     /**
      * Kills all ping threads and wait for them to cleanup.
      */
-    void shutdown();
+    void shutdown(bool allowNetworking);
 
 private:
     /**
@@ -134,6 +136,7 @@ private:
     // Contains all lock ids to keeping on retrying to unlock until success.
     std::list<DistLockHandle> _unlockList;  // (M)
 
-    bool _inShutdown = false;  // (M)
+    bool _inShutdown = false;                // (M)
+    bool _allowNetworkingInShutdown = true;  // (M)
 };
 }

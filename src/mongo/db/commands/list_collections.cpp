@@ -32,6 +32,7 @@
 
 
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/cursor_manager.h"
 #include "mongo/db/catalog/database.h"
@@ -41,17 +42,19 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/queued_data_stage.h"
 #include "mongo/db/exec/working_set.h"
-#include "mongo/db/query/cursor_responses.h"
-#include "mongo/db/query/find_constants.h"
+#include "mongo/db/query/cursor_response.h"
+#include "mongo/db/query/find_common.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/storage_engine.h"
+#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
-using std::unique_ptr;
 using std::list;
 using std::string;
 using std::stringstream;
+using std::unique_ptr;
+using stdx::make_unique;
 
 class CmdListCollections : public Command {
 public:
@@ -99,7 +102,7 @@ public:
              int,
              string& errmsg,
              BSONObjBuilder& result) {
-        std::unique_ptr<MatchExpression> matcher;
+        unique_ptr<MatchExpression> matcher;
         BSONElement filterElt = jsobj["filter"];
         if (!filterElt.eoo()) {
             if (filterElt.type() != mongo::Object) {
@@ -111,7 +114,7 @@ public:
             if (!statusWithMatcher.isOK()) {
                 return appendCommandStatus(result, statusWithMatcher.getStatus());
             }
-            matcher.reset(statusWithMatcher.getValue());
+            matcher = std::move(statusWithMatcher.getValue());
         }
 
         const long long defaultBatchSize = std::numeric_limits<long long>::max();
@@ -124,66 +127,61 @@ public:
         ScopedTransaction scopedXact(txn, MODE_IS);
         AutoGetDb autoDb(txn, dbname, MODE_S);
 
-        const Database* d = autoDb.getDb();
-        const DatabaseCatalogEntry* dbEntry = NULL;
+        const Database* db = autoDb.getDb();
 
-        list<string> names;
-        if (d) {
-            dbEntry = d->getDatabaseCatalogEntry();
-            dbEntry->getCollectionNamespaces(&names);
-            names.sort();
-        }
+        auto ws = make_unique<WorkingSet>();
+        auto root = make_unique<QueuedDataStage>(txn, ws.get());
 
-        std::unique_ptr<WorkingSet> ws(new WorkingSet());
-        std::unique_ptr<QueuedDataStage> root(new QueuedDataStage(ws.get()));
+        if (db) {
+            // TODO when we stop needing to sort the output, don't copy to a vector and just iterate
+            // db.
+            auto collections = std::vector<Collection*>(db->begin(), db->end());
+            std::sort(collections.begin(),
+                      collections.end(),
+                      [](Collection* l, Collection* r) { return l->ns().coll() < r->ns().coll(); });
 
-        for (std::list<std::string>::const_iterator i = names.begin(); i != names.end(); ++i) {
-            const std::string& ns = *i;
+            for (auto&& collection : collections) {
+                StringData collectionName = collection->ns().coll();
+                if (collectionName == "system.namespaces") {
+                    continue;
+                }
 
-            StringData collection = nsToCollectionSubstring(ns);
-            if (collection == "system.namespaces") {
-                continue;
+                BSONObjBuilder b;
+                b.append("name", collectionName);
+
+                CollectionOptions options =
+                    collection->getCatalogEntry()->getCollectionOptions(txn);
+                b.append("options", options.toBSON());
+
+                BSONObj maybe = b.obj();
+                if (matcher && !matcher->matchesBSON(maybe)) {
+                    continue;
+                }
+
+                WorkingSetID id = ws->allocate();
+                WorkingSetMember* member = ws->get(id);
+                member->keyData.clear();
+                member->loc = RecordId();
+                member->obj = Snapshotted<BSONObj>(SnapshotId(), maybe);
+                member->transitionToOwnedObj();
+                root->pushBack(id);
             }
-
-            BSONObjBuilder b;
-            b.append("name", collection);
-
-            CollectionOptions options =
-                dbEntry->getCollectionCatalogEntry(ns)->getCollectionOptions(txn);
-            b.append("options", options.toBSON());
-
-            BSONObj maybe = b.obj();
-            if (matcher && !matcher->matchesBSON(maybe)) {
-                continue;
-            }
-
-            WorkingSetMember member;
-            member.state = WorkingSetMember::OWNED_OBJ;
-            member.keyData.clear();
-            member.loc = RecordId();
-            member.obj = Snapshotted<BSONObj>(SnapshotId(), maybe);
-            root->pushBack(member);
         }
 
         std::string cursorNamespace = str::stream() << dbname << ".$cmd." << name;
         dassert(NamespaceString(cursorNamespace).isValid());
-        dassert(NamespaceString(cursorNamespace).isListCollectionsGetMore());
+        dassert(NamespaceString(cursorNamespace).isListCollectionsCursorNS());
 
-        PlanExecutor* rawExec;
-        Status makeStatus = PlanExecutor::make(txn,
-                                               ws.release(),
-                                               root.release(),
-                                               cursorNamespace,
-                                               PlanExecutor::YIELD_MANUAL,
-                                               &rawExec);
-        std::unique_ptr<PlanExecutor> exec(rawExec);
-        if (!makeStatus.isOK()) {
-            return appendCommandStatus(result, makeStatus);
+        auto statusWithPlanExecutor = PlanExecutor::make(
+            txn, std::move(ws), std::move(root), cursorNamespace, PlanExecutor::YIELD_MANUAL);
+        if (!statusWithPlanExecutor.isOK()) {
+            return appendCommandStatus(result, statusWithPlanExecutor.getStatus());
         }
+        unique_ptr<PlanExecutor> exec = std::move(statusWithPlanExecutor.getValue());
 
         BSONArrayBuilder firstBatch;
 
-        const int byteLimit = MaxBytesToReturnToClientAtOnce;
+        const int byteLimit = FindCommon::kMaxBytesToReturnToClientAtOnce;
         for (long long objCount = 0; objCount < batchSize && firstBatch.len() < byteLimit;
              objCount++) {
             BSONObj next;
@@ -198,8 +196,12 @@ public:
         CursorId cursorId = 0LL;
         if (!exec->isEOF()) {
             exec->saveState();
-            ClientCursor* cursor = new ClientCursor(
-                CursorManager::getGlobalCursorManager(), exec.release(), cursorNamespace);
+            exec->detachFromOperationContext();
+            ClientCursor* cursor =
+                new ClientCursor(CursorManager::getGlobalCursorManager(),
+                                 exec.release(),
+                                 cursorNamespace,
+                                 txn->recoveryUnit()->isReadingFromMajorityCommittedSnapshot());
             cursorId = cursor->cursorid();
         }
 

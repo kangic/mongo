@@ -75,7 +75,8 @@ typedef SetState::Nodes Nodes;
 const double socketTimeoutSecs = 5;
 
 // TODO: Move to ReplicaSetMonitorManager
-ReplicaSetMonitor::ConfigChangeHook configChangeHook;
+ReplicaSetMonitor::ConfigChangeHook asyncConfigChangeHook;
+ReplicaSetMonitor::ConfigChangeHook syncConfigChangeHook;
 
 // global background job responsible for checking every X amount of time
 class ReplicaSetMonitorWatcher : public BackgroundJob {
@@ -127,7 +128,7 @@ protected:
         // using it.
         if (!inShutdown() && !StaticObserver::_destroyingStatics) {
             stdx::unique_lock<stdx::mutex> sl(_monitorMutex);
-            _stopRequestedCV.timed_wait(sl, boost::posix_time::seconds(10));
+            _stopRequestedCV.wait_for(sl, stdx::chrono::seconds(10));
         }
 
         while (!inShutdown() && !StaticObserver::_destroyingStatics) {
@@ -151,7 +152,7 @@ protected:
                 break;
             }
 
-            _stopRequestedCV.timed_wait(sl, boost::posix_time::seconds(10));
+            _stopRequestedCV.wait_for(sl, stdx::chrono::seconds(10));
         }
     }
 
@@ -257,17 +258,7 @@ int ReplicaSetMonitor::maxConsecutiveFailedChecks = 30;
 bool ReplicaSetMonitor::useDeterministicHostSelection = false;
 
 ReplicaSetMonitor::ReplicaSetMonitor(StringData name, const std::set<HostAndPort>& seeds)
-    : _state(std::make_shared<SetState>(name, seeds)) {
-    log() << "starting new replica set monitor for replica set " << name << " with seeds ";
-
-    for (std::set<HostAndPort>::const_iterator it = seeds.begin(); it != seeds.end(); ++it) {
-        if (it != seeds.begin()) {
-            log() << ',';
-        }
-
-        log() << *it;
-    }
-}
+    : _state(std::make_shared<SetState>(name, seeds)) {}
 
 HostAndPort ReplicaSetMonitor::getHostOrRefresh(const ReadPreferenceSetting& criteria) {
     {
@@ -367,9 +358,14 @@ void ReplicaSetMonitor::remove(const string& name) {
     globalConnPool.removeHost(name);
 }
 
-void ReplicaSetMonitor::setConfigChangeHook(ConfigChangeHook hook) {
-    massert(13610, "ConfigChangeHook already specified", !configChangeHook);
-    configChangeHook = hook;
+void ReplicaSetMonitor::setAsynchronousConfigChangeHook(ConfigChangeHook hook) {
+    invariant(!asyncConfigChangeHook);
+    asyncConfigChangeHook = hook;
+}
+
+void ReplicaSetMonitor::setSynchronousConfigChangeHook(ConfigChangeHook hook) {
+    invariant(!syncConfigChangeHook);
+    syncConfigChangeHook = hook;
 }
 
 // TODO move to correct order with non-statics before pushing
@@ -498,8 +494,19 @@ void Refresher::receivedIsMaster(const HostAndPort& from,
     }
 
     if (reply.setName != _set->name) {
-        warning() << "node: " << from << " isn't a part of set: " << _set->name
-                  << " ismaster: " << replyObj;
+        if (reply.raw["isreplicaset"].trueValue()) {
+            // The reply came from a node in the state referred to as RSGhost in the SDAM
+            // spec. RSGhost corresponds to either REMOVED or STARTUP member states. In any event,
+            // if a reply from a ghost offers a list of possible other members of the replica set,
+            // and if this refresher has yet to find the replica set master, we add hosts listed in
+            // the reply to the list of possible replica set members.
+            if (!_scan->foundUpMaster) {
+                _scan->possibleNodes.insert(reply.normalHosts.begin(), reply.normalHosts.end());
+            }
+        } else {
+            warning() << "node: " << from << " isn't a part of set: " << _set->name
+                      << " ismaster: " << replyObj;
+        }
         failedHost(from);
         return;
     }
@@ -642,10 +649,14 @@ bool Refresher::receivedIsMasterFromMaster(const IsMasterReply& reply) {
         // and we want to record our changes
         log() << "changing hosts to " << _set->getServerAddress() << " from " << oldAddr;
 
-        if (configChangeHook) {
+        if (syncConfigChangeHook) {
+            syncConfigChangeHook(_set->name, _set->getServerAddress());
+        }
+
+        if (asyncConfigChangeHook) {
             // call from a separate thread to avoid blocking and holding lock while potentially
             // going over the network
-            stdx::thread bg(configChangeHook, _set->name, _set->getServerAddress());
+            stdx::thread bg(asyncConfigChangeHook, _set->name, _set->getServerAddress());
             bg.detach();
         }
     }

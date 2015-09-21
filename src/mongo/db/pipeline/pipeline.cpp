@@ -33,6 +33,7 @@
 #include "mongo/db/pipeline/pipeline_optimizations.h"
 
 #include "mongo/db/auth/action_set.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/commands.h"
@@ -42,6 +43,7 @@
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/repl/read_concern_args.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
@@ -62,38 +64,12 @@ const char Pipeline::mongosPipelineName[] = "mongosPipeline";
 Pipeline::Pipeline(const intrusive_ptr<ExpressionContext>& pTheCtx)
     : explain(false), pCtx(pTheCtx) {}
 
-
-/* this structure is used to make a lookup table of operators */
-struct StageDesc {
-    const char* pName;
-    intrusive_ptr<DocumentSource>(*pFactory)(BSONElement, const intrusive_ptr<ExpressionContext>&);
-};
-
-/* this table must be in alphabetical order by name for bsearch() */
-static const StageDesc stageDesc[] = {
-    {DocumentSourceGeoNear::geoNearName, DocumentSourceGeoNear::createFromBson},
-    {DocumentSourceGroup::groupName, DocumentSourceGroup::createFromBson},
-    {DocumentSourceLimit::limitName, DocumentSourceLimit::createFromBson},
-    {DocumentSourceMatch::matchName, DocumentSourceMatch::createFromBson},
-    {DocumentSourceMergeCursors::name, DocumentSourceMergeCursors::createFromBson},
-    {DocumentSourceOut::outName, DocumentSourceOut::createFromBson},
-    {DocumentSourceProject::projectName, DocumentSourceProject::createFromBson},
-    {DocumentSourceRedact::redactName, DocumentSourceRedact::createFromBson},
-    {DocumentSourceSkip::skipName, DocumentSourceSkip::createFromBson},
-    {DocumentSourceSort::sortName, DocumentSourceSort::createFromBson},
-    {DocumentSourceUnwind::unwindName, DocumentSourceUnwind::createFromBson},
-};
-static const size_t nStageDesc = sizeof(stageDesc) / sizeof(StageDesc);
-
-static int stageDescCmp(const void* pL, const void* pR) {
-    return strcmp(((const StageDesc*)pL)->pName, ((const StageDesc*)pR)->pName);
-}
-
 intrusive_ptr<Pipeline> Pipeline::parseCommand(string& errmsg,
                                                const BSONObj& cmdObj,
                                                const intrusive_ptr<ExpressionContext>& pCtx) {
     intrusive_ptr<Pipeline> pPipeline(new Pipeline(pCtx));
     vector<BSONElement> pipeline;
+    repl::ReadConcernArgs readConcernArgs;
 
     /* gather the specification for the aggregation */
     for (BSONObj::iterator cmdIterator = cmdObj.begin(); cmdIterator.more();) {
@@ -107,6 +83,11 @@ intrusive_ptr<Pipeline> Pipeline::parseCommand(string& errmsg,
 
         // maxTimeMS is also for the command processor.
         if (pFieldName == LiteParsedQuery::cmdOptionMaxTimeMS) {
+            continue;
+        }
+
+        if (pFieldName == repl::ReadConcernArgs::kReadConcernFieldName) {
+            uassertStatusOK(readConcernArgs.initialize(cmdElement));
             continue;
         }
 
@@ -174,32 +155,17 @@ intrusive_ptr<Pipeline> Pipeline::parseCommand(string& errmsg,
         uassert(15942,
                 str::stream() << "pipeline element " << iStep << " is not an object",
                 pipeElement.type() == Object);
-        BSONObj bsonObj(pipeElement.Obj());
 
-        // Parse a pipeline stage from 'bsonObj'.
-        uassert(16435,
-                "A pipeline stage specification object must contain exactly one field.",
-                bsonObj.nFields() == 1);
-        BSONElement stageSpec = bsonObj.firstElement();
-        const char* stageName = stageSpec.fieldName();
-
-        // Create a DocumentSource pipeline stage from 'stageSpec'.
-        StageDesc key;
-        key.pName = stageName;
-        const StageDesc* pDesc =
-            (const StageDesc*)bsearch(&key, stageDesc, nStageDesc, sizeof(StageDesc), stageDescCmp);
-
-        uassert(16436,
-                str::stream() << "Unrecognized pipeline stage name: '" << stageName << "'",
-                pDesc);
-        intrusive_ptr<DocumentSource> stage = pDesc->pFactory(stageSpec, pCtx);
-        verify(stage);
-        sources.push_back(stage);
+        sources.push_back(DocumentSource::parse(pCtx, pipeElement.Obj()));
 
         // TODO find a good general way to check stages that must be first syntactically
 
-        if (dynamic_cast<DocumentSourceOut*>(stage.get())) {
+        if (dynamic_cast<DocumentSourceOut*>(sources.back().get())) {
             uassert(16991, "$out can only be the final stage in the pipeline", iStep == nSteps - 1);
+
+            uassert(ErrorCodes::InvalidOptions,
+                    "$out can only be used with the 'local' read concern level",
+                    readConcernArgs.getLevel() == repl::ReadConcernLevel::kLocalReadConcern);
         }
     }
 
@@ -350,21 +316,33 @@ void Pipeline::Optimizations::Local::duplicateMatchBeforeInitalRedact(Pipeline* 
     }
 }
 
-void Pipeline::addRequiredPrivileges(Command* commandTemplate,
-                                     const string& db,
-                                     BSONObj cmdObj,
-                                     vector<Privilege>* out) {
-    ResourcePattern inputResource(commandTemplate->parseResourcePattern(db, cmdObj));
+Status Pipeline::checkAuthForCommand(ClientBasic* client,
+                                     const std::string& db,
+                                     const BSONObj& cmdObj) {
+    NamespaceString inputNs(db, cmdObj.firstElement().str());
+    auto inputResource = ResourcePattern::forExactNamespace(inputNs);
     uassert(17138,
-            mongoutils::str::stream() << "Invalid input resource, " << inputResource.toString(),
-            inputResource.isExactNamespacePattern());
+            mongoutils::str::stream() << "Invalid input namespace, " << inputNs.ns(),
+            inputNs.isValid());
 
-    out->push_back(Privilege(inputResource, ActionType::find));
+    std::vector<Privilege> privileges;
+
+    if (cmdObj.getFieldDotted("pipeline.0.$indexStats")) {
+        Privilege::addPrivilegeToPrivilegeVector(
+            &privileges,
+            Privilege(ResourcePattern::forAnyNormalResource(), ActionType::indexStats));
+    } else {
+        // If no source requiring an alternative permission scheme is specified then default to
+        // requiring find() privileges on the given namespace.
+        Privilege::addPrivilegeToPrivilegeVector(&privileges,
+                                                 Privilege(inputResource, ActionType::find));
+    }
 
     BSONObj pipeline = cmdObj.getObjectField("pipeline");
     BSONForEach(stageElem, pipeline) {
         BSONObj stage = stageElem.embeddedObjectUserCheck();
-        if (str::equals(stage.firstElementFieldName(), "$out")) {
+        StringData stageName = stage.firstElementFieldName();
+        if (stageName == "$out" && stage.firstElementType() == String) {
             NamespaceString outputNs(db, stage.firstElement().str());
             uassert(17139,
                     mongoutils::str::stream() << "Invalid $out target namespace, " << outputNs.ns(),
@@ -376,10 +354,19 @@ void Pipeline::addRequiredPrivileges(Command* commandTemplate,
             if (shouldBypassDocumentValidationForCommand(cmdObj)) {
                 actions.addAction(ActionType::bypassDocumentValidation);
             }
-
-            out->push_back(Privilege(ResourcePattern::forExactNamespace(outputNs), actions));
+            Privilege::addPrivilegeToPrivilegeVector(
+                &privileges, Privilege(ResourcePattern::forExactNamespace(outputNs), actions));
+        } else if (stageName == "$lookUp" && stage.firstElementType() == Object) {
+            NamespaceString fromNs(db, stage.firstElement()["from"].str());
+            Privilege::addPrivilegeToPrivilegeVector(
+                &privileges,
+                Privilege(ResourcePattern::forExactNamespace(fromNs), ActionType::find));
         }
     }
+
+    if (AuthorizationSession::get(client)->isAuthorizedForPrivileges(privileges))
+        return Status::OK();
+    return Status(ErrorCodes::Unauthorized, "unauthorized");
 }
 
 intrusive_ptr<Pipeline> Pipeline::splitForSharded() {
@@ -479,13 +466,21 @@ BSONObj Pipeline::getInitialQuery() const {
     return match->getQuery();
 }
 
-bool Pipeline::hasOutStage() const {
-    if (sources.empty()) {
-        return false;
+bool Pipeline::needsPrimaryShardMerger() const {
+    for (auto&& source : sources) {
+        if (source->needsPrimaryShard()) {
+            return true;
+        }
     }
+    return false;
+}
 
-    // The $out stage must be the last one in the pipeline, so check if the last stage is $out.
-    return dynamic_cast<DocumentSourceOut*>(sources.back().get());
+std::vector<NamespaceString> Pipeline::getInvolvedCollections() const {
+    std::vector<NamespaceString> collections;
+    for (auto&& source : sources) {
+        source->addInvolvedCollections(&collections);
+    }
+    return collections;
 }
 
 Document Pipeline::serialize() const {

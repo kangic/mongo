@@ -39,6 +39,7 @@
 namespace mongo {
 
 class DBClientCursorHolder;
+class OperationContext;
 class StaleConfigException;
 class ParallelConnectionMetadata;
 
@@ -150,7 +151,7 @@ public:
     std::string getNS();
 
     /** call before using */
-    void init();
+    void init(OperationContext* txn);
 
     bool more();
     BSONObj next();
@@ -158,9 +159,9 @@ public:
         return "ParallelSort";
     }
 
-    void fullInit();
-    void startInit();
-    void finishInit();
+    void fullInit(OperationContext* txn);
+    void startInit(OperationContext* txn);
+    void finishInit(OperationContext* txn);
 
     bool isCommand() {
         return NamespaceString(_qSpec.ns()).isCommand();
@@ -193,7 +194,7 @@ public:
      * Returns the single shard with an open cursor.
      * It is an error to call this if getNumQueryShards() > 1
      */
-    std::shared_ptr<Shard> getQueryShard();
+    ShardId getQueryShardId();
 
     /**
      * Returns primary shard with an open cursor.
@@ -202,9 +203,6 @@ public:
     std::shared_ptr<Shard> getPrimary();
 
     DBClientCursorPtr getShardCursor(const ShardId& shardId);
-
-    BSONObj toBSON() const;
-    std::string toString() const;
 
     void explain(BSONObjBuilder& b);
 
@@ -217,7 +215,10 @@ private:
                       const StaleConfigException& e,
                       bool& forceReload,
                       bool& fullReload);
-    void _handleStaleNS(const NamespaceString& staleNS, bool forceReload, bool fullReload);
+    void _handleStaleNS(OperationContext* txn,
+                        const NamespaceString& staleNS,
+                        bool forceReload,
+                        bool fullReload);
 
     bool _didInit;
     bool _done;
@@ -227,7 +228,9 @@ private:
 
     // Count round-trips req'd for namespaces and total
     std::map<std::string, int> _staleNSMap;
+
     int _totalTries;
+    bool _cmChangeAttempted;
 
     std::map<ShardId, PCMData> _cursorMap;
 
@@ -245,7 +248,8 @@ private:
      * set connection and the primary cannot be reached, the version
      * will not be set if the slaveOk flag is set.
      */
-    void setupVersionAndHandleSlaveOk(PCStatePtr state /* in & out */,
+    void setupVersionAndHandleSlaveOk(OperationContext* txn,
+                                      PCStatePtr state /* in & out */,
                                       const ShardId& shardId,
                                       std::shared_ptr<Shard> primary /* in */,
                                       const NamespaceString& ns,
@@ -297,81 +301,6 @@ private:
     std::unique_ptr<ParallelConnectionMetadata> _pcmData;
 };
 
-/**
- * Generally clients should be using Strategy::commandOp() wherever possible - the Future API
- * does not handle versioning.
- *
- * tools for doing asynchronous operations
- * right now uses underlying sync network ops and uses another thread
- * should be changed to use non-blocking io
- */
-class Future {
-public:
-    class CommandResult {
-    public:
-        std::string getServer() const {
-            return _server;
-        }
+void throwCursorStale(DBClientCursor* cursor);
 
-        bool isDone() const {
-            return _done;
-        }
-
-        bool ok() const {
-            verify(_done);
-            return _ok;
-        }
-
-        BSONObj result() const {
-            verify(_done);
-            return _res;
-        }
-
-        /**
-           blocks until command is done
-           returns ok()
-         */
-        bool join(int maxRetries = 1);
-
-    private:
-        CommandResult(const std::string& server,
-                      const std::string& db,
-                      const BSONObj& cmd,
-                      int options,
-                      DBClientBase* conn,
-                      bool useShardedConn);
-        void init();
-
-        std::string _server;
-        std::string _db;
-        int _options;
-        BSONObj _cmd;
-        DBClientBase* _conn;
-        std::unique_ptr<AScopedConnection> _connHolder;  // used if not provided a connection
-        bool _useShardConn;
-
-        std::unique_ptr<DBClientCursor> _cursor;
-
-        BSONObj _res;
-        bool _ok;
-        bool _done;
-
-        friend class Future;
-    };
-
-
-    /**
-     * @param server server name
-     * @param db db name
-     * @param cmd cmd to exec
-     * @param conn optional connection to use.  will use standard pooled if non-specified
-     * @param useShardConn use ShardConnection
-     */
-    static std::shared_ptr<CommandResult> spawnCommand(const std::string& server,
-                                                       const std::string& db,
-                                                       const BSONObj& cmd,
-                                                       int options,
-                                                       DBClientBase* conn = 0,
-                                                       bool useShardConn = false);
-};
-}
+}  // namespace mongo

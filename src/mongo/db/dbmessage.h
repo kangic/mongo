@@ -192,7 +192,7 @@ private:
 class Value : public EncodedValueStorage<Layout, ConstView, View> {
 public:
     Value() {
-        BOOST_STATIC_ASSERT(sizeof(Value) == sizeof(Layout));
+        static_assert(sizeof(Value) == sizeof(Layout), "sizeof(Value) == sizeof(Layout)");
     }
 
     Value(ZeroInitTag_t zit) : EncodedValueStorage<Layout, ConstView, View>(zit) {}
@@ -207,7 +207,7 @@ public:
 */
 class DbMessage {
     // Assume sizeof(int) == 4 bytes
-    BOOST_STATIC_ASSERT(sizeof(int) == 4);
+    static_assert(sizeof(int) == 4, "sizeof(int) == 4");
 
 public:
     // Note: DbMessage constructor reads the first 4 bytes and stores it in reserved
@@ -327,7 +327,7 @@ struct DbResponse {
 void replyToQuery(int queryResultFlags,
                   AbstractMessagingPort* p,
                   Message& requestMsg,
-                  void* data,
+                  const void* data,
                   int size,
                   int nReturned,
                   int startingFrom = 0,

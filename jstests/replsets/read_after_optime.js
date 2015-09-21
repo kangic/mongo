@@ -7,8 +7,6 @@ var replTest = new ReplSetTest({ nodes: 2 });
 replTest.startSet();
 
 var config = replTest.getReplSetConfig();
-// TODO: SERVER-18298 uncomment once implemented.
-//config.protocolVersion = 1;
 replTest.initiate(config);
 
 var runTest = function(testDB, primaryConn) {
@@ -23,8 +21,8 @@ var runTest = function(testDB, primaryConn) {
     var res = assert.commandFailed(testDB.runCommand({
         find: 'user',
         filter: { x: 1 },
-        $readConcern: {
-            afterOpTime: { ts: twoSecTS, term: 0 }
+        readConcern: {
+            afterOpTime: { ts: twoSecTS, t: 0 }
         },
         maxTimeMS: 1000
     }));
@@ -41,8 +39,8 @@ var runTest = function(testDB, primaryConn) {
     res = assert.commandWorked(testDB.runCommand({
         find: 'user',
         filter: { x: 1 },
-        $readConcern: {
-            afterOpTime: { ts: twoSecTS, term: 0 },
+        readConcern: {
+            afterOpTime: { ts: twoSecTS, t: 0 },
             maxTimeMS: 10 * 1000
         }
     }));

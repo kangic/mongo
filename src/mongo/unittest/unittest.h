@@ -126,13 +126,12 @@
  * Behaves like ASSERT_THROWS, above, but also fails if calling what() on the thrown exception
  * does not return a string equal to EXPECTED_WHAT.
  */
-#define ASSERT_THROWS_WHAT(STATEMENT, EXCEPTION_TYPE, EXPECTED_WHAT)                  \
-    ASSERT_THROWS_PRED(STATEMENT,                                                     \
-                       EXCEPTION_TYPE,                                                \
-                       ::mongo::stdx::bind(std::equal_to<std::string>(),              \
-                                           (EXPECTED_WHAT),                           \
-                                           ::mongo::stdx::bind(&EXCEPTION_TYPE::what, \
-                                                               ::mongo::stdx::placeholders::_1)))
+#define ASSERT_THROWS_WHAT(STATEMENT, EXCEPTION_TYPE, EXPECTED_WHAT)                 \
+    ASSERT_THROWS_PRED(STATEMENT,                                                    \
+                       EXCEPTION_TYPE,                                               \
+                       ([&](const EXCEPTION_TYPE& ex) {                              \
+        return ::mongo::StringData(ex.what()) == ::mongo::StringData(EXPECTED_WHAT); \
+                       }))
 
 /**
  * Behaves like ASSERT_THROWS, above, but also fails if calling getCode() on the thrown exception
@@ -339,6 +338,7 @@ private:
     bool _isCapturingLogMessages;
     std::vector<std::string> _capturedLogMessages;
     logger::MessageLogDomain::AppenderHandle _captureAppenderHandle;
+    logger::MessageLogDomain::AppenderAutoPtr _captureAppender;
 };
 
 /**
@@ -533,12 +533,6 @@ T assertGet(StatusWith<T>&& swt) {
     ASSERT_OK(swt.getStatus());
     return std::move(swt.getValue());
 }
-
-/**
- * Hack to support the runaway test observer in dbtests.  This is a hook that
- * unit test running harnesses (unittest_main and dbtests) must implement.
- */
-void onCurrentTestNameChange(const std::string& testName);
 
 /**
  * Return a list of suite names.

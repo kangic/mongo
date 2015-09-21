@@ -78,7 +78,8 @@ private:
 
 class GeoMatchExpression : public LeafMatchExpression {
 public:
-    GeoMatchExpression() : LeafMatchExpression(GEO) {}
+    GeoMatchExpression() : LeafMatchExpression(GEO), _canSkipValidation(false) {}
+
     virtual ~GeoMatchExpression() {}
 
     /**
@@ -94,7 +95,15 @@ public:
 
     virtual bool equivalent(const MatchExpression* other) const;
 
-    virtual LeafMatchExpression* shallowClone() const;
+    virtual std::unique_ptr<MatchExpression> shallowClone() const;
+
+    void setCanSkipValidation(bool val) {
+        _canSkipValidation = val;
+    }
+
+    bool getCanSkipValidation() const {
+        return _canSkipValidation;
+    }
 
     const GeoExpression& getGeoExpression() const {
         return *_query;
@@ -107,6 +116,7 @@ private:
     BSONObj _rawObj;
     // Share ownership of our query with all of our clones
     std::shared_ptr<const GeoExpression> _query;
+    bool _canSkipValidation;
 };
 
 
@@ -168,7 +178,7 @@ public:
 
     virtual bool equivalent(const MatchExpression* other) const;
 
-    virtual LeafMatchExpression* shallowClone() const;
+    virtual std::unique_ptr<MatchExpression> shallowClone() const;
 
     const GeoNearExpression& getData() const {
         return *_query;

@@ -39,6 +39,9 @@
 
 #include "mongo/db/client.h"
 #include "mongo/db/instance.h"
+#include "mongo/stdx/chrono.h"
+#include "mongo/stdx/future.h"
+#include "mongo/stdx/thread.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
@@ -75,7 +78,8 @@ bool shouldStartService() {
     return _startService;
 }
 
-static void WINAPI serviceCtrl(DWORD ctrlCode);
+static DWORD WINAPI
+serviceCtrl(DWORD dwControl, DWORD dwEventType, LPVOID lpEventData, LPVOID lpContext);
 
 void configureService(ServiceCallback serviceCallback,
                       const moe::Environment& params,
@@ -409,6 +413,21 @@ void installServiceOrDie(const wstring& serviceName,
         log() << "Could not set service description. Check the Windows Event Log for more details.";
     }
 
+    // Set the pre-shutdown notification with a timeout of 10 minutes.
+    // Windows will either wait for us to finish with SERVICE_STOPPED or it will timeout, whichever
+    // is first.
+    SERVICE_PRESHUTDOWN_INFO servicePreshutdownInfo;
+    servicePreshutdownInfo.dwPreshutdownTimeout = 10 * 60 * 1000;  // 10 minutes
+
+    BOOL ret = ::ChangeServiceConfig2(
+        schService, SERVICE_CONFIG_PRESHUTDOWN_INFO, &servicePreshutdownInfo);
+    if (!ret) {
+        DWORD gle = ::GetLastError();
+        error() << "Failed to set timeout for pre-shutdown notification with error: "
+                << errnoWithDescription(gle);
+        serviceInstalled = false;
+    }
+
     ::CloseServiceHandle(schService);
     ::CloseServiceHandle(schSCManager);
 
@@ -480,7 +499,7 @@ bool reportStatus(DWORD reportState, DWORD waitHint, DWORD exitCode) {
             dwControlsAccepted = 0;
             break;
         default:
-            dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN;
+            dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_PRESHUTDOWN;
             break;
     }
 
@@ -502,15 +521,6 @@ bool reportStatus(DWORD reportState, DWORD waitHint, DWORD exitCode) {
     return SetServiceStatus(_statusHandle, &ssStatus);
 }
 
-static void serviceStopWorker() {
-    Client::initThread("serviceStopWorker");
-
-    // Stop the process
-    // TODO: SERVER-5703, separate the "cleanup for shutdown" functionality from
-    // the "terminate process" functionality in exitCleanly.
-    exitCleanly(EXIT_WINDOWS_SERVICE_STOP);
-}
-
 // Minimum of time we tell Windows to wait before we are guilty of a hung shutdown
 const int kStopWaitHintMillis = 30000;
 
@@ -519,19 +529,32 @@ const int kStopWaitHintMillis = 30000;
 // On client OSes, SERVICE_CONTROL_SHUTDOWN has a 5 second timeout configured in
 // HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control
 static void serviceStop() {
-    stdx::thread serviceWorkerThread(serviceStopWorker);
+    // VS2013 Doesn't support future<void>, so fake it with a bool.
+    stdx::packaged_task<bool()> exitCleanlyTask([] {
+        Client::initThread("serviceStopWorker");
+        // Stop the process
+        // TODO: SERVER-5703, separate the "cleanup for shutdown" functionality from
+        // the "terminate process" functionality in exitCleanly.
+        exitCleanly(EXIT_WINDOWS_SERVICE_STOP);
+        return true;
+    });
+    stdx::future<bool> exitedCleanly = exitCleanlyTask.get_future();
+
+    // Launch the packaged task in a thread. We needn't ever join it,
+    // so it doesn't even need a name.
+    stdx::thread(std::move(exitCleanlyTask)).detach();
+
+    const auto timeout = stdx::chrono::milliseconds(kStopWaitHintMillis / 2);
 
     // We periodically check if we are done exiting by polling at half of each wait interval
-    //
-    while (
-        !serviceWorkerThread.try_join_for(boost::chrono::milliseconds(kStopWaitHintMillis / 2))) {
+    while (exitedCleanly.wait_for(timeout) != stdx::future_status::ready) {
         reportStatus(SERVICE_STOP_PENDING, kStopWaitHintMillis);
         log() << "Service Stop is waiting for storage engine to finish shutdown";
     }
 }
 
 static void WINAPI initService(DWORD argc, LPTSTR* argv) {
-    _statusHandle = RegisterServiceCtrlHandler(_serviceName.c_str(), serviceCtrl);
+    _statusHandle = RegisterServiceCtrlHandlerEx(_serviceName.c_str(), serviceCtrl, NULL);
     if (!_statusHandle)
         return;
 
@@ -563,15 +586,24 @@ static void serviceShutdown(const char* controlCodeName) {
     // Note: we will report exit status in initService
 }
 
-static void WINAPI serviceCtrl(DWORD ctrlCode) {
-    switch (ctrlCode) {
+static DWORD WINAPI
+serviceCtrl(DWORD dwControl, DWORD dwEventType, LPVOID lpEventData, LPVOID lpContext) {
+    switch (dwControl) {
+        case SERVICE_CONTROL_INTERROGATE:
+            // Return NO_ERROR per MSDN even though we do nothing for this control code.
+            return NO_ERROR;
         case SERVICE_CONTROL_STOP:
             serviceShutdown("SERVICE_CONTROL_STOP");
-            break;
-        case SERVICE_CONTROL_SHUTDOWN:
-            serviceShutdown("SERVICE_CONTROL_SHUTDOWN");
-            break;
+            // Return NO_ERROR since we handle the STOP
+            return NO_ERROR;
+        case SERVICE_CONTROL_PRESHUTDOWN:
+            serviceShutdown("SERVICE_CONTROL_PRESHUTDOWN");
+            // Return NO_ERROR since we handle the PRESHUTDOWN
+            return NO_ERROR;
     }
+
+    // Return ERROR_CALL_NOT_IMPLEMENTED as the default
+    return ERROR_CALL_NOT_IMPLEMENTED;
 }
 
 void startService() {

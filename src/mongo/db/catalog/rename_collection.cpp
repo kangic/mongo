@@ -70,7 +70,7 @@ Status renameCollection(OperationContext* txn,
     ScopedTransaction transaction(txn, MODE_X);
     Lock::GlobalWrite globalWriteLock(txn->lockState());
     // We stay in source context the whole time. This is mostly to set the CurOp namespace.
-    OldClientContext ctx(txn, source);
+    OldClientContext ctx(txn, source.ns());
 
     bool userInitiatedWritesAndNotPrimary = txn->writesAreReplicated() &&
         !repl::getGlobalReplicationCoordinator()->canAcceptWritesFor(source);
@@ -192,7 +192,7 @@ Status renameCollection(OperationContext* txn,
 
             // Process the source index.
             BSONObjBuilder newIndex;
-            newIndex.append("ns", target);
+            newIndex.append("ns", target.ns());
             newIndex.appendElementsUnique(currIndex);
             indexesToCopy.push_back(newIndex.obj());
         }
@@ -211,7 +211,7 @@ Status renameCollection(OperationContext* txn,
             // No logOp necessary because the entire renameCollection command is one logOp.
             bool shouldReplicateWrites = txn->writesAreReplicated();
             txn->setReplicatedWrites(false);
-            Status status = targetColl->insertDocument(txn, obj, &indexer, true).getStatus();
+            Status status = targetColl->insertDocument(txn, obj, &indexer, true);
             txn->setReplicatedWrites(shouldReplicateWrites);
             if (!status.isOK())
                 return status;

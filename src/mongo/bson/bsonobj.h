@@ -77,6 +77,7 @@ typedef std::multiset<BSONElement, BSONElementCmpWithoutField> BSONElementMSet;
  OID:       an OID object
  NumberDouble: <double>
  NumberInt: <int32>
+ NumberDecimal: <dec128>
  String:    <unsigned32 strsizewithnull><cstring>
  Date:      <8bytes>
  Regex:     <cstring regex><cstring options>
@@ -518,8 +519,11 @@ public:
         opELEM_MATCH = 0x12,
         opNEAR = 0x13,
         opWITHIN = 0x14,
-        opMAX_DISTANCE = 0x15,
         opGEO_INTERSECTS = 0x16,
+        opBITS_ALL_SET = 0x17,
+        opBITS_ALL_CLEAR = 0x18,
+        opBITS_ANY_SET = 0x19,
+        opBITS_ANY_CLEAR = 0x1A,
     };
 
     /** add all elements of the object to the specified vector */

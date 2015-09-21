@@ -36,6 +36,9 @@
 #include <map>
 #include <set>
 
+#include "mongo/bson/util/bson_extract.h"
+#include "mongo/client/remote_command_targeter.h"
+#include "mongo/db/commands.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/index_bounds_builder.h"
 #include "mongo/db/query/query_planner.h"
@@ -55,14 +58,14 @@
 
 namespace mongo {
 
-using std::shared_ptr;
-
 using std::make_pair;
 using std::map;
 using std::max;
 using std::pair;
 using std::set;
+using std::shared_ptr;
 using std::string;
+using std::unique_ptr;
 using std::vector;
 
 namespace {
@@ -73,7 +76,7 @@ namespace {
  *
  * The mongos adapter here tracks all shards, and stores ranges by (max, Chunk) in the map.
  */
-class CMConfigDiffTracker : public ConfigDiffTracker<shared_ptr<Chunk>, string> {
+class CMConfigDiffTracker : public ConfigDiffTracker<shared_ptr<Chunk>> {
 public:
     CMConfigDiffTracker(ChunkManager* manager) : _manager(manager) {}
 
@@ -86,13 +89,14 @@ public:
         return false;
     }
 
-    pair<BSONObj, shared_ptr<Chunk>> rangeFor(const ChunkType& chunk) const final {
-        shared_ptr<Chunk> c(new Chunk(_manager, chunk.toBSON()));
+    pair<BSONObj, shared_ptr<Chunk>> rangeFor(OperationContext* txn,
+                                              const ChunkType& chunk) const final {
+        shared_ptr<Chunk> c(new Chunk(txn, _manager, chunk));
         return make_pair(chunk.getMax(), c);
     }
 
-    string shardFor(const string& hostName) const final {
-        const auto shard = grid.shardRegistry()->getShard(hostName);
+    string shardFor(OperationContext* txn, const string& hostName) const final {
+        const auto shard = grid.shardRegistry()->getShard(txn, hostName);
         return shard->getId();
     }
 
@@ -161,7 +165,7 @@ ChunkManager::ChunkManager(const string& ns, const ShardKeyPattern& pattern, boo
       _chunkRanges() {}
 
 ChunkManager::ChunkManager(const CollectionType& coll)
-    : _ns(coll.getNs()),
+    : _ns(coll.getNs().ns()),
       _keyPattern(coll.getKeyPattern()),
       _unique(coll.getUnique()),
       _sequenceNumber(NextSequenceNumber.addAndFetch(1)),
@@ -169,7 +173,7 @@ ChunkManager::ChunkManager(const CollectionType& coll)
     _version = ChunkVersion::fromBSON(coll.toBSON());
 }
 
-void ChunkManager::loadExistingRanges(const ChunkManager* oldManager) {
+void ChunkManager::loadExistingRanges(OperationContext* txn, const ChunkManager* oldManager) {
     int tries = 3;
 
     while (tries--) {
@@ -179,7 +183,7 @@ void ChunkManager::loadExistingRanges(const ChunkManager* oldManager) {
 
         Timer t;
 
-        bool success = _load(chunkMap, shardIds, &shardVersions, oldManager);
+        bool success = _load(txn, chunkMap, shardIds, &shardVersions, oldManager);
         if (success) {
             log() << "ChunkManager: time to load chunks for " << _ns << ": " << t.millis() << "ms"
                   << " sequenceNumber: " << _sequenceNumber << " version: " << _version.toString()
@@ -212,7 +216,8 @@ void ChunkManager::loadExistingRanges(const ChunkManager* oldManager) {
                               << " after 3 attempts. Please try again.");
 }
 
-bool ChunkManager::_load(ChunkMap& chunkMap,
+bool ChunkManager::_load(OperationContext* txn,
+                         ChunkMap& chunkMap,
                          set<ShardId>& shardIds,
                          ShardVersionMap* shardVersions,
                          const ChunkManager* oldManager) {
@@ -254,14 +259,25 @@ bool ChunkManager::_load(ChunkMap& chunkMap,
     differ.attach(_ns, chunkMap, _version, *shardVersions);
 
     // Diff tracker should *always* find at least one chunk if collection exists
-    int diffsApplied = differ.calculateConfigDiff(grid.catalogManager());
+    // Get the diff query required
+    auto diffQuery = differ.configDiffQuery();
+
+    repl::OpTime opTime;
+    std::vector<ChunkType> chunks;
+    uassertStatusOK(grid.catalogManager(txn)->getChunks(
+        txn, diffQuery.query, diffQuery.sort, boost::none, &chunks, &opTime));
+
+    invariant(opTime >= _configOpTime);
+    _configOpTime = opTime;
+
+    int diffsApplied = differ.calculateConfigDiff(txn, chunks);
     if (diffsApplied > 0) {
         LOG(2) << "loaded " << diffsApplied << " chunks into new chunk manager for " << _ns
                << " with version " << _version;
 
         // Add all existing shards we find to the shards set
         for (ShardVersionMap::iterator it = shardVersions->begin(); it != shardVersions->end();) {
-            shared_ptr<Shard> shard = grid.shardRegistry()->getShard(it->first);
+            shared_ptr<Shard> shard = grid.shardRegistry()->getShard(txn, it->first);
             if (shard) {
                 shardIds.insert(it->first);
                 ++it;
@@ -269,6 +285,8 @@ bool ChunkManager::_load(ChunkMap& chunkMap,
                 shardVersions->erase(it++);
             }
         }
+
+        _configOpTime = opTime;
 
         return true;
     } else if (diffsApplied == 0) {
@@ -281,6 +299,7 @@ bool ChunkManager::_load(ChunkMap& chunkMap,
         shardVersions->clear();
 
         _version = ChunkVersion(0, 0, OID());
+        _configOpTime = opTime;
 
         return true;
     } else {  // diffsApplied < 0
@@ -307,12 +326,12 @@ bool ChunkManager::_load(ChunkMap& chunkMap,
     }
 }
 
-shared_ptr<ChunkManager> ChunkManager::reload(bool force) const {
+shared_ptr<ChunkManager> ChunkManager::reload(OperationContext* txn, bool force) const {
     const NamespaceString nss(_ns);
-    auto status = grid.catalogCache()->getDatabase(nss.db().toString());
+    auto status = grid.catalogCache()->getDatabase(txn, nss.db().toString());
     shared_ptr<DBConfig> config = uassertStatusOK(status);
 
-    return config->getChunkManager(getns(), force);
+    return config->getChunkManagerIfExists(txn, getns(), force);
 }
 
 void ChunkManager::_printChunks() const {
@@ -321,14 +340,14 @@ void ChunkManager::_printChunks() const {
     }
 }
 
-void ChunkManager::calcInitSplitsAndShards(const ShardId& primaryShardId,
+void ChunkManager::calcInitSplitsAndShards(OperationContext* txn,
+                                           const ShardId& primaryShardId,
                                            const vector<BSONObj>* initPoints,
                                            const set<ShardId>* initShardIds,
                                            vector<BSONObj>* splitPoints,
                                            vector<ShardId>* shardIds) const {
     verify(_chunkMap.size() == 0);
 
-    unsigned long long numObjects = 0;
     Chunk c(this,
             _keyPattern.getKeyPattern().globalMin(),
             _keyPattern.getKeyPattern().globalMax(),
@@ -336,19 +355,24 @@ void ChunkManager::calcInitSplitsAndShards(const ShardId& primaryShardId,
 
     if (!initPoints || !initPoints->size()) {
         // discover split points
-        {
-            const auto primaryShard = grid.shardRegistry()->getShard(primaryShardId);
-            // get stats to see if there is any data
-            ScopedDbConnection shardConn(primaryShard->getConnString());
+        const auto primaryShard = grid.shardRegistry()->getShard(txn, primaryShardId);
+        auto targetStatus =
+            primaryShard->getTargeter()->findHost({ReadPreference::PrimaryPreferred, TagSet{}});
+        uassertStatusOK(targetStatus);
 
-            numObjects = shardConn->count(getns());
-            shardConn.done();
-        }
+        NamespaceString nss(getns());
+        auto result = grid.shardRegistry()->runCommand(
+            txn, targetStatus.getValue(), nss.db().toString(), BSON("count" << nss.coll()));
+
+        long long numObjects = 0;
+        uassertStatusOK(result.getStatus());
+        uassertStatusOK(Command::getStatusFromCommandResult(result.getValue()));
+        uassertStatusOK(bsonExtractIntegerField(result.getValue(), "n", &numObjects));
 
         if (numObjects > 0)
-            c.pickSplitVector(*splitPoints, Chunk::MaxChunkSize);
+            c.pickSplitVector(txn, *splitPoints, Chunk::MaxChunkSize);
 
-        // since docs alread exists, must use primary shard
+        // since docs already exists, must use primary shard
         shardIds->push_back(primaryShardId);
     } else {
         // make sure points are unique and ordered
@@ -371,7 +395,8 @@ void ChunkManager::calcInitSplitsAndShards(const ShardId& primaryShardId,
     }
 }
 
-void ChunkManager::createFirstChunks(const ShardId& primaryShardId,
+void ChunkManager::createFirstChunks(OperationContext* txn,
+                                     const ShardId& primaryShardId,
                                      const vector<BSONObj>* initPoints,
                                      const set<ShardId>* initShardIds) {
     // TODO distlock?
@@ -380,7 +405,7 @@ void ChunkManager::createFirstChunks(const ShardId& primaryShardId,
 
     vector<BSONObj> splitPoints;
     vector<ShardId> shardIds;
-    calcInitSplitsAndShards(primaryShardId, initPoints, initShardIds, &splitPoints, &shardIds);
+    calcInitSplitsAndShards(txn, primaryShardId, initPoints, initShardIds, &splitPoints, &shardIds);
 
 
     // this is the first chunk; start the versioning from scratch
@@ -403,8 +428,13 @@ void ChunkManager::createFirstChunks(const ShardId& primaryShardId,
 
         BSONObj chunkObj = chunkBuilder.obj();
 
-        Status result = grid.catalogManager()->update(
-            ChunkType::ConfigNS, BSON(ChunkType::name(temp.genID())), chunkObj, true, false, NULL);
+        Status result = grid.catalogManager(txn)->update(txn,
+                                                         ChunkType::ConfigNS,
+                                                         BSON(ChunkType::name(temp.genID())),
+                                                         chunkObj,
+                                                         true,
+                                                         false,
+                                                         NULL);
 
         version.incMinor();
 
@@ -419,7 +449,7 @@ void ChunkManager::createFirstChunks(const ShardId& primaryShardId,
     _version = ChunkVersion(0, 0, version.epoch());
 }
 
-ChunkPtr ChunkManager::findIntersectingChunk(const BSONObj& shardKey) const {
+ChunkPtr ChunkManager::findIntersectingChunk(OperationContext* txn, const BSONObj& shardKey) const {
     {
         BSONObj chunkMin;
         ChunkPtr chunk;
@@ -440,7 +470,7 @@ ChunkPtr ChunkManager::findIntersectingChunk(const BSONObj& shardKey) const {
             log() << *chunk;
             log() << shardKey;
 
-            reload();
+            reload(txn);
             msgasserted(13141, "Chunk map pointed to incorrect chunk");
         }
     }
@@ -452,15 +482,14 @@ ChunkPtr ChunkManager::findIntersectingChunk(const BSONObj& shardKey) const {
 }
 
 void ChunkManager::getShardIdsForQuery(set<ShardId>& shardIds, const BSONObj& query) const {
-    CanonicalQuery* canonicalQuery = NULL;
-    Status status = CanonicalQuery::canonicalize(_ns, query, &canonicalQuery, WhereCallbackNoop());
+    auto statusWithCQ =
+        CanonicalQuery::canonicalize(NamespaceString(_ns), query, WhereCallbackNoop());
 
-    std::unique_ptr<CanonicalQuery> canonicalQueryPtr(canonicalQuery);
-
-    uassert(status.code(), status.reason(), status.isOK());
+    uassertStatusOK(statusWithCQ.getStatus());
+    unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
     // Query validation
-    if (QueryPlannerCommon::hasNode(canonicalQuery->root(), MatchExpression::GEO_NEAR)) {
+    if (QueryPlannerCommon::hasNode(cq->root(), MatchExpression::GEO_NEAR)) {
         uassert(13501, "use geoNear command rather than $near query", false);
     }
 
@@ -470,7 +499,7 @@ void ChunkManager::getShardIdsForQuery(set<ShardId>& shardIds, const BSONObj& qu
     //   Query { a : { $gte : 1, $lt : 2 },
     //            b : { $gte : 3, $lt : 4 } }
     //   => Bounds { a : [1, 2), b : [3, 4) }
-    IndexBounds bounds = getIndexBoundsForQuery(_keyPattern.toBSON(), canonicalQuery);
+    IndexBounds bounds = getIndexBoundsForQuery(_keyPattern.toBSON(), *cq);
 
     // Transforms bounds for each shard key field into full shard key ranges
     // for example :
@@ -525,12 +554,12 @@ void ChunkManager::getAllShardIds(set<ShardId>* all) const {
 }
 
 IndexBounds ChunkManager::getIndexBoundsForQuery(const BSONObj& key,
-                                                 const CanonicalQuery* canonicalQuery) {
+                                                 const CanonicalQuery& canonicalQuery) {
     // $text is not allowed in planning since we don't have text index on mongos.
     //
     // TODO: Treat $text query as a no-op in planning. So with shard key {a: 1},
     //       the query { a: 2, $text: { ... } } will only target to {a: 2}.
-    if (QueryPlannerCommon::hasNode(canonicalQuery->root(), MatchExpression::TEXT)) {
+    if (QueryPlannerCommon::hasNode(canonicalQuery.root(), MatchExpression::TEXT)) {
         IndexBounds bounds;
         IndexBoundsBuilder::allValuesBounds(key, &bounds);  // [minKey, maxKey]
         return bounds;
@@ -555,7 +584,7 @@ IndexBounds ChunkManager::getIndexBoundsForQuery(const BSONObj& key,
     plannerParams.indices.push_back(indexEntry);
 
     OwnedPointerVector<QuerySolution> solutions;
-    Status status = QueryPlanner::plan(*canonicalQuery, plannerParams, &solutions.mutableVector());
+    Status status = QueryPlanner::plan(canonicalQuery, plannerParams, &solutions.mutableVector());
     uassert(status.code(), status.reason(), status.isOK());
 
     IndexBounds bounds;
@@ -794,6 +823,10 @@ int ChunkManager::getCurrentDesiredChunkSize() const {
     }
 
     return splitThreshold;
+}
+
+repl::OpTime ChunkManager::getConfigOpTime() const {
+    return _configOpTime;
 }
 
 }  // namespace mongo

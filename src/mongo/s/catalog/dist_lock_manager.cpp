@@ -39,8 +39,6 @@ namespace mongo {
 const stdx::chrono::milliseconds DistLockManager::kDefaultSingleLockAttemptTimeout(0);
 const stdx::chrono::milliseconds DistLockManager::kDefaultLockRetryInterval(1000);
 
-DistLockManager::ScopedDistLock::ScopedDistLock() : _lockManager(nullptr) {}
-
 DistLockManager::ScopedDistLock::ScopedDistLock(DistLockHandle lockHandle,
                                                 DistLockManager* lockManager)
     : _lockID(std::move(lockHandle)), _lockManager(lockManager) {}
@@ -51,13 +49,16 @@ DistLockManager::ScopedDistLock::~ScopedDistLock() {
     }
 }
 
-DistLockManager::ScopedDistLock::ScopedDistLock(ScopedDistLock&& other) {
+DistLockManager::ScopedDistLock::ScopedDistLock(ScopedDistLock&& other) : _lockManager(nullptr) {
     *this = std::move(other);
 }
 
 DistLockManager::ScopedDistLock& DistLockManager::ScopedDistLock::operator=(
     ScopedDistLock&& other) {
     if (this != &other) {
+        if (_lockManager) {
+            _lockManager->unlock(_lockID);
+        }
         _lockID = std::move(other._lockID);
         _lockManager = other._lockManager;
         other._lockManager = nullptr;

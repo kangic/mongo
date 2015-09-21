@@ -32,7 +32,6 @@
 
 #include "mongo/db/auth/authorization_manager.h"
 
-#include <boost/bind.hpp>
 #include <memory>
 #include <string>
 #include <vector>
@@ -414,18 +413,20 @@ Status AuthorizationManager::getUserDescription(OperationContext* txn,
     return _externalState->getUserDescription(txn, userName, result);
 }
 
-Status AuthorizationManager::getRoleDescription(const RoleName& roleName,
+Status AuthorizationManager::getRoleDescription(OperationContext* txn,
+                                                const RoleName& roleName,
                                                 bool showPrivileges,
                                                 BSONObj* result) {
-    return _externalState->getRoleDescription(roleName, showPrivileges, result);
+    return _externalState->getRoleDescription(txn, roleName, showPrivileges, result);
 }
 
-Status AuthorizationManager::getRoleDescriptionsForDB(const std::string dbname,
+Status AuthorizationManager::getRoleDescriptionsForDB(OperationContext* txn,
+                                                      const std::string dbname,
                                                       bool showPrivileges,
                                                       bool showBuiltinRoles,
                                                       vector<BSONObj>* result) {
     return _externalState->getRoleDescriptionsForDB(
-        dbname, showPrivileges, showBuiltinRoles, result);
+        txn, dbname, showPrivileges, showBuiltinRoles, result);
 }
 
 Status AuthorizationManager::acquireUser(OperationContext* txn,

@@ -28,6 +28,7 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
 #include <string>
 
 #include "mongo/base/disallow_copying.h"
@@ -99,6 +100,11 @@ public:
     virtual Date_t now() = 0;
 
     /**
+     * Returns the hostname of the current process.
+     */
+    virtual std::string getHostName() = 0;
+
+    /**
      * Starts asynchronous execution of the command described by "request".
      */
     virtual void startCommand(const TaskExecutor::CallbackHandle& cbHandle,
@@ -110,6 +116,19 @@ public:
      * completed.
      */
     virtual void cancelCommand(const TaskExecutor::CallbackHandle& cbHandle) = 0;
+
+    /**
+     * Requests cancelation of incomplete network activity.
+     */
+    virtual void cancelAllCommands() = 0;
+
+    /**
+     * Sets an alarm, which schedules "action" to run no sooner than "when".
+     *
+     * "action" should not do anything that requires a lot of computation, or that might block for a
+     * long time, as it may execute in a network thread.
+     */
+    virtual void setAlarm(Date_t when, const stdx::function<void()>& action) = 0;
 
 protected:
     NetworkInterface();

@@ -81,9 +81,21 @@ void massertNamespaceNotIndex(StringData ns, StringData caller) {
 
 class Database::AddCollectionChange : public RecoveryUnit::Change {
 public:
-    AddCollectionChange(Database* db, StringData ns) : _db(db), _ns(ns.toString()) {}
+    AddCollectionChange(OperationContext* txn, Database* db, StringData ns)
+        : _txn(txn), _db(db), _ns(ns.toString()) {}
 
-    virtual void commit() {}
+    virtual void commit() {
+        CollectionMap::const_iterator it = _db->_collections.find(_ns);
+        if (it == _db->_collections.end())
+            return;
+
+        // Ban reading from this collection on committed reads on snapshots before now.
+        auto replCoord = repl::ReplicationCoordinator::get(_txn);
+        auto snapshotName = replCoord->reserveSnapshotName(_txn);
+        replCoord->forceSnapshotCreation();  // Ensures a newer snapshot gets created even if idle.
+        it->second->setMinimumVisibleSnapshot(snapshotName);
+    }
+
     virtual void rollback() {
         CollectionMap::const_iterator it = _db->_collections.find(_ns);
         if (it == _db->_collections.end())
@@ -93,6 +105,7 @@ public:
         _db->_collections.erase(it);
     }
 
+    OperationContext* const _txn;
     Database* const _db;
     const std::string _ns;
 };
@@ -449,7 +462,7 @@ Status Database::renameCollection(OperationContext* txn,
         Top::get(txn->getClient()->getServiceContext()).collectionDropped(fromNS.toString());
     }
 
-    txn->recoveryUnit()->registerChange(new AddCollectionChange(this, toNS));
+    txn->recoveryUnit()->registerChange(new AddCollectionChange(txn, this, toNS));
     Status s = _dbEntry->renameCollection(txn, fromNS, toNS, stayTemp);
     _collections[toNS] = _getOrCreateCollectionInstance(txn, toNS);
     return s;
@@ -489,7 +502,7 @@ Collection* Database::createCollection(OperationContext* txn,
 
     audit::logCreateCollection(&cc(), ns);
 
-    txn->recoveryUnit()->registerChange(new AddCollectionChange(this, ns));
+    txn->recoveryUnit()->registerChange(new AddCollectionChange(txn, this, ns));
 
     Status status = _dbEntry->createCollection(txn, ns, options, true /*allocateDefaultSpace*/);
     massertNoTraceStatusOK(status);
@@ -534,6 +547,7 @@ void dropAllDatabasesExceptLocal(OperationContext* txn) {
         return;
     log() << "dropAllDatabasesExceptLocal " << n.size() << endl;
 
+    repl::getGlobalReplicationCoordinator()->dropAllSnapshots();
     for (vector<string>::iterator i = n.begin(); i != n.end(); i++) {
         if (*i != "local") {
             MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
@@ -596,10 +610,24 @@ Status userCreateNS(OperationContext* txn,
     if (!status.isOK())
         return status;
 
-    status = validateStorageOptions(collectionOptions.storageEngine,
-                                    &StorageEngine::Factory::validateCollectionStorageOptions);
+    status =
+        validateStorageOptions(collectionOptions.storageEngine,
+                               stdx::bind(&StorageEngine::Factory::validateCollectionStorageOptions,
+                                          stdx::placeholders::_1,
+                                          stdx::placeholders::_2));
     if (!status.isOK())
         return status;
+
+    if (auto indexOptions = collectionOptions.indexOptionDefaults["storageEngine"]) {
+        status =
+            validateStorageOptions(indexOptions.Obj(),
+                                   stdx::bind(&StorageEngine::Factory::validateIndexStorageOptions,
+                                              stdx::placeholders::_1,
+                                              stdx::placeholders::_2));
+        if (!status.isOK()) {
+            return status;
+        }
+    }
 
     invariant(db->createCollection(txn, ns, collectionOptions, createDefaultIndexes));
 

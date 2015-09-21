@@ -35,12 +35,12 @@
 #include <string>
 #include <string.h>
 
-#include <boost/static_assert.hpp>
 
 #include "mongo/base/data_type_endian.h"
 #include "mongo/base/data_view.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/inline_decls.h"
+#include "mongo/platform/decimal128.h"
 #include "mongo/util/allocator.h"
 #include "mongo/util/assert_util.h"
 
@@ -53,8 +53,6 @@ namespace mongo {
 struct PackedDouble {
     double d;
 } PACKED_DECL;
-
-
 /* Note the limit here is rather arbitrary and is simply a standard. generally the code works
    with any object that fits in ram.
 
@@ -186,7 +184,7 @@ public:
     }
 
     void appendUChar(unsigned char j) {
-        BOOST_STATIC_ASSERT(CHAR_BIT == 8);
+        static_assert(CHAR_BIT == 8, "CHAR_BIT == 8");
         appendNumImpl(j);
     }
     void appendChar(char j) {
@@ -196,11 +194,11 @@ public:
         appendNumImpl(j);
     }
     void appendNum(short j) {
-        BOOST_STATIC_ASSERT(sizeof(short) == 2);
+        static_assert(sizeof(short) == 2, "sizeof(short) == 2");
         appendNumImpl(j);
     }
     void appendNum(int j) {
-        BOOST_STATIC_ASSERT(sizeof(int) == 4);
+        static_assert(sizeof(int) == 4, "sizeof(int) == 4");
         appendNumImpl(j);
     }
     void appendNum(unsigned j) {
@@ -211,15 +209,19 @@ public:
     void appendNum(bool j) = delete;
 
     void appendNum(double j) {
-        BOOST_STATIC_ASSERT(sizeof(double) == 8);
+        static_assert(sizeof(double) == 8, "sizeof(double) == 8");
         appendNumImpl(j);
     }
     void appendNum(long long j) {
-        BOOST_STATIC_ASSERT(sizeof(long long) == 8);
+        static_assert(sizeof(long long) == 8, "sizeof(long long) == 8");
         appendNumImpl(j);
     }
     void appendNum(unsigned long long j) {
         appendNumImpl(j);
+    }
+    void appendNum(Decimal128 j) {
+        BOOST_STATIC_ASSERT(sizeof(Decimal128::Value) == 16);
+        appendNumImpl(j.getValue());
     }
 
     void appendBuf(const void* src, size_t len) {
@@ -291,8 +293,6 @@ private:
         // we bake that assumption in here. This decision should be revisited soon.
         DataView(grow(sizeof(t))).write(tagLittleEndian(t));
     }
-
-
     /* "slow" portion of 'grow()'  */
     void NOINLINE_DECL grow_reallocate(int minSize) {
         int a = 64;

@@ -52,21 +52,24 @@ class ReplicaSetConfig {
 public:
     typedef std::vector<MemberConfig>::const_iterator MemberIterator;
 
+    static const std::string kConfigServerFieldName;
     static const std::string kVersionFieldName;
     static const std::string kMajorityWriteConcernModeName;
 
     static const size_t kMaxMembers = 50;
     static const size_t kMaxVotingMembers = 7;
-    static const Seconds kDefaultHeartbeatTimeoutPeriod;
 
-    ReplicaSetConfig();
-    std::string asBson() {
-        return "";
-    }
+    static const Milliseconds kDefaultElectionTimeoutPeriod;
+    static const Milliseconds kDefaultHeartbeatInterval;
+    static const Seconds kDefaultHeartbeatTimeoutPeriod;
+    static const int kDefaultElectionTimeoutOffsetLimit;
+
     /**
      * Initializes this ReplicaSetConfig from the contents of "cfg".
+     * The default protocol version is 0 to keep backward-compatibility.
+     * If usePV1ByDefault is true, the protocol version will be 1 when it's not specified in "cfg".
      */
-    Status initialize(const BSONObj& cfg);
+    Status initialize(const BSONObj& cfg, bool usePV1ByDefault = false);
 
     /**
      * Returns true if this object has been successfully initialized or copied from
@@ -166,6 +169,21 @@ public:
     }
 
     /**
+     * Interval between the time the last heartbeat from a node was received successfully, or
+     * the time when we gave up retrying, and when the next heartbeat should be sent to a target.
+     * Returns default heartbeat interval if this configuration is not initialized.
+     */
+    Milliseconds getHeartbeatInterval() const;
+
+    /**
+     * Gets the timeout for determining when the current PRIMARY is dead, which triggers a node to
+     * run for election.
+     */
+    Milliseconds getElectionTimeoutPeriod() const {
+        return _electionTimeoutPeriod;
+    }
+
+    /**
      * Gets the amount of time to wait for a response to hearbeats sent to other
      * nodes in the replica set.
      */
@@ -201,6 +219,13 @@ public:
      */
     bool isChainingAllowed() const {
         return _chainingAllowed;
+    }
+
+    /**
+     * Returns true if this replica set is for use as a config server replica set.
+     */
+    bool isConfigServer() const {
+        return _configServer;
     }
 
     /**
@@ -254,11 +279,29 @@ public:
         return _protocolVersion;
     }
 
+    /**
+     * Returns the duration to wait before running for election when this node (indicated by
+     * "memberIdx") sees that it has higher priority than the current primary.
+     */
+    Milliseconds getPriorityTakeoverDelay(int memberIdx) const;
+
+    /**
+     * Returns the upper bound (in Milliseconds) of the election timeout's random offset.
+     */
+    int getElectionTimeoutOffsetLimit() const {
+        return _electionTimeoutOffsetLimit;
+    }
+
 private:
     /**
      * Parses the "settings" subdocument of a replica set configuration.
      */
     Status _parseSettingsSubdocument(const BSONObj& settings);
+
+    /**
+     * Return the number of members with a priority greater than "priority".
+     */
+    int _calculatePriorityRank(int priority) const;
 
     /**
      * Calculates and stores the majority for electing a primary (_majorityVoteCount).
@@ -270,19 +313,23 @@ private:
      */
     void _addInternalWriteConcernModes();
 
-    bool _isInitialized;
+    bool _isInitialized = false;
     long long _version;
     std::string _replSetName;
     std::vector<MemberConfig> _members;
     WriteConcernOptions _defaultWriteConcern;
-    Seconds _heartbeatTimeoutPeriod;
+    Milliseconds _electionTimeoutPeriod = Milliseconds(2000);
+    Milliseconds _heartbeatInterval = kDefaultHeartbeatInterval;
+    Seconds _heartbeatTimeoutPeriod = Seconds(0);
     bool _chainingAllowed;
+    int _electionTimeoutOffsetLimit;
     int _majorityVoteCount;
     int _writeMajority;
     int _totalVotingMembers;
     ReplicaSetTagConfig _tagConfig;
     StringMap<ReplicaSetTagPattern> _customWriteConcernModes;
-    long long _protocolVersion;
+    long long _protocolVersion = 0;
+    bool _configServer = false;
 };
 
 

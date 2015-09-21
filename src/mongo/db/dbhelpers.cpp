@@ -1,32 +1,30 @@
-// dbhelpers.cpp
-
 /**
-*    Copyright (C) 2008-2014 MongoDB Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2008-2014 MongoDB Inc.
+ *
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
+ *
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
 
@@ -61,7 +59,8 @@
 #include "mongo/db/storage_options.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/db/write_concern_options.h"
-#include "mongo/s/d_state.h"
+#include "mongo/db/s/collection_metadata.h"
+#include "mongo/db/s/sharding_state.h"
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
@@ -85,7 +84,7 @@ void Helpers::ensureIndex(OperationContext* txn,
                           const char* name) {
     BSONObjBuilder b;
     b.append("name", name);
-    b.append("ns", collection->ns());
+    b.append("ns", collection->ns().ns());
     b.append("key", keyPattern);
     b.appendBool("unique", unique);
     BSONObj o = b.done();
@@ -129,20 +128,20 @@ RecordId Helpers::findOne(OperationContext* txn,
     if (!collection)
         return RecordId();
 
-    CanonicalQuery* cq;
     const WhereCallbackReal whereCallback(txn, collection->ns().db());
 
-    massert(17244,
-            "Could not canonicalize " + query.toString(),
-            CanonicalQuery::canonicalize(collection->ns(), query, &cq, whereCallback).isOK());
+    auto statusWithCQ = CanonicalQuery::canonicalize(collection->ns(), query, whereCallback);
+    massert(17244, "Could not canonicalize " + query.toString(), statusWithCQ.isOK());
+    unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
-    PlanExecutor* rawExec;
     size_t options = requireIndex ? QueryPlannerParams::NO_TABLE_SCAN : QueryPlannerParams::DEFAULT;
+    auto statusWithPlanExecutor =
+        getExecutor(txn, collection, std::move(cq), PlanExecutor::YIELD_MANUAL, options);
     massert(17245,
             "Could not get executor for query " + query.toString(),
-            getExecutor(txn, collection, cq, PlanExecutor::YIELD_MANUAL, &rawExec, options).isOK());
+            statusWithPlanExecutor.isOK());
 
-    unique_ptr<PlanExecutor> exec(rawExec);
+    unique_ptr<PlanExecutor> exec = std::move(statusWithPlanExecutor.getValue());
     PlanExecutor::ExecState state;
     RecordId loc;
     if (PlanExecutor::ADVANCED == (state = exec->getNext(NULL, &loc))) {
@@ -194,7 +193,8 @@ RecordId Helpers::findById(OperationContext* txn, Collection* collection, const 
 
 bool Helpers::getSingleton(OperationContext* txn, const char* ns, BSONObj& result) {
     AutoGetCollectionForRead ctx(txn, ns);
-    unique_ptr<PlanExecutor> exec(InternalPlanner::collectionScan(txn, ns, ctx.getCollection()));
+    unique_ptr<PlanExecutor> exec(
+        InternalPlanner::collectionScan(txn, ns, ctx.getCollection(), PlanExecutor::YIELD_MANUAL));
     PlanExecutor::ExecState state = exec->getNext(&result, NULL);
 
     CurOp::get(txn)->done();
@@ -209,7 +209,7 @@ bool Helpers::getSingleton(OperationContext* txn, const char* ns, BSONObj& resul
 bool Helpers::getLast(OperationContext* txn, const char* ns, BSONObj& result) {
     AutoGetCollectionForRead autoColl(txn, ns);
     unique_ptr<PlanExecutor> exec(InternalPlanner::collectionScan(
-        txn, ns, autoColl.getCollection(), InternalPlanner::BACKWARD));
+        txn, ns, autoColl.getCollection(), PlanExecutor::YIELD_MANUAL, InternalPlanner::BACKWARD));
     PlanExecutor::ExecState state = exec->getNext(&result, NULL);
 
     if (PlanExecutor::ADVANCED == state) {
@@ -354,6 +354,7 @@ long long Helpers::removeRange(OperationContext* txn,
                                            min,
                                            max,
                                            maxInclusive,
+                                           PlanExecutor::YIELD_MANUAL,
                                            InternalPlanner::FORWARD,
                                            InternalPlanner::IXSCAN_FETCH));
             exec->setYieldPolicy(PlanExecutor::YIELD_AUTO);
@@ -363,7 +364,6 @@ long long Helpers::removeRange(OperationContext* txn,
             PlanExecutor::ExecState state;
             // This may yield so we cannot touch nsd after this.
             state = exec->getNext(&obj, &rloc);
-            exec.reset();
             if (PlanExecutor::IS_EOF == state) {
                 break;
             }
@@ -389,12 +389,13 @@ long long Helpers::removeRange(OperationContext* txn,
 
                 // We should never be able to turn off the sharding state once enabled, but
                 // in the future we might want to.
-                verify(shardingState.enabled());
-
-                // In write lock, so will be the most up-to-date version
-                CollectionMetadataPtr metadataNow = shardingState.getCollectionMetadata(ns);
+                verify(ShardingState::get(getGlobalServiceContext())->enabled());
 
                 bool docIsOrphan;
+
+                // In write lock, so will be the most up-to-date version
+                std::shared_ptr<CollectionMetadata> metadataNow =
+                    ShardingState::get(getGlobalServiceContext())->getCollectionMetadata(ns);
                 if (metadataNow) {
                     ShardKeyPattern kp(metadataNow->getKeyPattern());
                     BSONObj key = kp.extractShardKeyFromDoc(obj);
@@ -519,8 +520,13 @@ Status Helpers::getLocsInRange(OperationContext* txn,
     bool isLargeChunk = false;
     long long docCount = 0;
 
-    unique_ptr<PlanExecutor> exec(
-        InternalPlanner::indexScan(txn, collection, idx, min, max, false));
+    unique_ptr<PlanExecutor> exec(InternalPlanner::indexScan(txn,
+                                                             collection,
+                                                             idx,
+                                                             min,
+                                                             max,
+                                                             false,  // endKeyInclusive
+                                                             PlanExecutor::YIELD_MANUAL));
     // we can afford to yield here because any change to the base data that we might miss  is
     // already being queued and will be migrated in the 'transferMods' stage
     exec->setYieldPolicy(PlanExecutor::YIELD_AUTO);

@@ -37,6 +37,7 @@ namespace mongo {
 class BSONObj;
 class BSONObjBuilder;
 class OperationContext;
+class StringData;
 
 /**
  * Utilities for converting metadata between the legacy OP_QUERY format and the new
@@ -104,24 +105,25 @@ using CommandReplyWithMetadata = std::tuple<BSONObj, BSONObj>;
  * Given a legacy command reply, attempts to strip the metadata from the reply and construct
  * a metadata object.
  */
-StatusWith<CommandReplyWithMetadata> upconvertReplyMetadata(BSONObj legacyReply);
+StatusWith<CommandReplyWithMetadata> upconvertReplyMetadata(const BSONObj& legacyReply);
 
 /**
  * Given a command reply object and an associated metadata object,
  * attempts to construct a legacy command object.
  */
-StatusWith<BSONObj> downconvertReplyMetadata(BSONObj commandReply, BSONObj replyMetadata);
+StatusWith<BSONObj> downconvertReplyMetadata(const BSONObj& commandReply,
+                                             const BSONObj& replyMetadata);
 
 /**
  * A function type for writing request metadata. The function takes a pointer to a
- * BSONObjBuilder used to construct the metadata object and returns a Status indicating
- * if the metadata was written successfully.
+ * BSONObjBuilder used to construct the metadata object and the server address of the
+ * target of the request and returns a Status indicating if the metadata was written successfully.
  */
-using RequestMetadataWriter = stdx::function<Status(BSONObjBuilder*)>;
+using RequestMetadataWriter = stdx::function<Status(BSONObjBuilder*, StringData)>;
 
 /**
  * A function type for reading reply metadata. The function takes a a reference to a
- * metadata object received in a command reply and a string containing the server address of the
+ * metadata object received in a command reply and the server address of the
  * host that executed the command and returns a Status indicating if the
  * metadata was read successfully.
  *

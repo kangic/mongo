@@ -90,9 +90,15 @@ enum StageType {
     STAGE_SHARDING_FILTER,
     STAGE_SKIP,
     STAGE_SORT,
+    STAGE_SORT_KEY_GENERATOR,
     STAGE_SORT_MERGE,
     STAGE_SUBPLAN,
+
+    // Stages for running text search.
     STAGE_TEXT,
+    STAGE_TEXT_OR,
+    STAGE_TEXT_MATCH,
+
     STAGE_UNKNOWN,
 
     STAGE_UPDATE,

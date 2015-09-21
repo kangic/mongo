@@ -328,7 +328,8 @@ bool GeoMatchExpression::matchesSingleElement(const BSONElement& e) const {
         return false;
 
     GeometryContainer geometry;
-    if (!geometry.parseFromStorage(e).isOK())
+
+    if (!geometry.parseFromStorage(e, _canSkipValidation).isOK())
         return false;
 
     // Never match big polygon
@@ -376,14 +377,15 @@ bool GeoMatchExpression::equivalent(const MatchExpression* other) const {
     return _rawObj == realOther->_rawObj;
 }
 
-LeafMatchExpression* GeoMatchExpression::shallowClone() const {
-    GeoMatchExpression* next = new GeoMatchExpression();
+std::unique_ptr<MatchExpression> GeoMatchExpression::shallowClone() const {
+    std::unique_ptr<GeoMatchExpression> next = stdx::make_unique<GeoMatchExpression>();
     next->init(path(), NULL, _rawObj);
     next->_query = _query;
+    next->_canSkipValidation = _canSkipValidation;
     if (getTag()) {
         next->setTag(getTag()->clone());
     }
-    return next;
+    return std::move(next);
 }
 
 //
@@ -432,13 +434,13 @@ bool GeoNearMatchExpression::equivalent(const MatchExpression* other) const {
     return _rawObj == realOther->_rawObj;
 }
 
-LeafMatchExpression* GeoNearMatchExpression::shallowClone() const {
-    GeoNearMatchExpression* next = new GeoNearMatchExpression();
+std::unique_ptr<MatchExpression> GeoNearMatchExpression::shallowClone() const {
+    std::unique_ptr<GeoNearMatchExpression> next = stdx::make_unique<GeoNearMatchExpression>();
     next->init(path(), NULL, _rawObj);
     next->_query = _query;
     if (getTag()) {
         next->setTag(getTag()->clone());
     }
-    return next;
+    return std::move(next);
 }
 }

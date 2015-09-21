@@ -75,19 +75,12 @@ var isMaster = db._adminCommand( "ismaster" );
 
 // Test buildinfo has the expected keys
 var expectedKeys = ["version", "gitVersion", "allocator", "versionArray", "javascriptEngine",
-    "openssl", "buildEnvironment", "debug", "maxBsonObjectSize", "bits" ];
+    "openssl", "buildEnvironment", "debug", "maxBsonObjectSize", "bits", "modules" ];
 
 var keys = Object.keySet(latestStartUpLog.buildinfo);
 // Disabled to check
 assert(arrayIsSubset(expectedKeys, keys), "buildinfo keys failed! \n expected:\t" + expectedKeys + "\n actual:\t" + keys);
 assert.eq(buildinfo, latestStartUpLog.buildinfo, "buildinfo doesn't match that from buildinfo command");
-
-var expectedBuildEnvKeys = [ "build_command", "cc", "ccflags", "cflags", "cxx", "cxxflags",
-    "linkflags", "modules", "target_arch", "target_os" ];
-var buildEnvKeys = Object.keySet(latestStartUpLog.buildinfo.buildEnvironment);
-assert(arrayIsSubset(expectedBuildEnvKeys, buildEnvKeys,
-    "buildEnvironment keys failed! \n expected: \t" + expectedBuildEnvKeys + "\n actual:\t" +
-    buildEnvKeys));
 
 // Test version and version Array
 var version = latestStartUpLog.buildinfo.version.split('-')[0];
@@ -99,5 +92,5 @@ for (var i = 0; i < (versionArray.length - 1); i++) if (versionArray[i] >= 0) { 
 assert.eq(serverStatus.version, latestStartUpLog.buildinfo.version, "Mongo version doesn't match that from ServerStatus");
 assert.eq(version, versionArrayCleaned.join('.'), "version doesn't match that from the versionArray");
 var jsEngine = latestStartUpLog.buildinfo.javascriptEngine;
-assert((jsEngine.startsWith("v8") || jsEngine == "none"));
+assert((jsEngine.startsWith("v8") || jsEngine == "none" || jsEngine.startsWith("mozjs")));
 assert.eq(isMaster.maxBsonObjectSize, latestStartUpLog.buildinfo.maxBsonObjectSize, "maxBsonObjectSize doesn't match one from ismaster");

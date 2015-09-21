@@ -1,5 +1,4 @@
-// cursors.h
-/*
+/**
  *    Copyright (C) 2010 10gen Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
@@ -27,7 +26,6 @@
  *    then also delete it in the license file.
  */
 
-
 #pragma once
 
 #include <string>
@@ -39,7 +37,6 @@
 namespace mongo {
 
 class QueryMessage;
-
 
 class ShardedClientCursor {
     MONGO_DISALLOW_COPYING(ShardedClientCursor);
@@ -66,7 +63,7 @@ public:
      *
      * @return true if this is not the final batch.
      */
-    bool sendNextBatch(int ntoreturn, BufBuilder& buffer, int& docCount);
+    bool sendNextBatch(int batchSize, BufBuilder& buffer, int& docCount);
 
     void accessed();
     /** @return idle time in ms */
@@ -96,8 +93,6 @@ typedef std::shared_ptr<ShardedClientCursor> ShardedClientCursorPtr;
 
 class CursorCache {
 public:
-    static long long TIMEOUT;
-
     typedef std::map<long long, ShardedClientCursorPtr> MapSharded;
     typedef std::map<long long, int> MapShardedInt;
     typedef std::map<long long, std::string> MapNormal;
@@ -154,4 +149,5 @@ private:
 };
 
 extern CursorCache cursorCache;
-}
+
+}  // namespace mongo

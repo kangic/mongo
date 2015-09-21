@@ -95,10 +95,6 @@ Status addMongosOptions(moe::OptionSection* options) {
         .setSources(moe::SourceAllLegacy);
 
     sharding_options.addOptionChaining(
-                         "upgrade", "upgrade", moe::Switch, "upgrade meta data version")
-        .setSources(moe::SourceAllLegacy);
-
-    sharding_options.addOptionChaining(
         "sharding.chunkSize", "chunkSize", moe::Int, "maximum amount of data per chunk");
 
     sharding_options.addOptionChaining("net.http.JSONPEnabled",
@@ -267,21 +263,16 @@ Status storeMongosOptions(const moe::Environment& params, const std::vector<std:
 
     std::vector<HostAndPort> configServers = mongosGlobalParams.configdbs.getServers();
 
-    if (!(mongosGlobalParams.configdbs.type() == ConnectionString::SYNC) &&
-        !(mongosGlobalParams.configdbs.type() == ConnectionString::SET &&
-          configServers.size() == 1)) {
-        return Status(ErrorCodes::BadValue,
-                      "Must have either 3 node old-style config servers, or a single server "
-                      "replica set config server");
+    if (mongosGlobalParams.configdbs.type() != ConnectionString::SYNC &&
+        mongosGlobalParams.configdbs.type() != ConnectionString::SET) {
+        return Status(
+            ErrorCodes::BadValue,
+            "Must have either 3 node legacy config servers, or a replica set config server");
     }
 
     if (configServers.size() < 3) {
         warning() << "running with less than 3 config servers should be done only for testing "
                      "purposes and is not recommended for production";
-    }
-
-    if (params.count("upgrade")) {
-        mongosGlobalParams.upgrade = params["upgrade"].as<bool>();
     }
 
     return Status::OK();

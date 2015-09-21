@@ -39,6 +39,7 @@
 #include "mongo/db/instance.h"
 #include "mongo/db/json.h"
 #include "mongo/dbtests/dbtests.h"
+#include "mongo/stdx/memory.h"
 
 using namespace mongo;
 
@@ -47,20 +48,24 @@ namespace {
 using std::max;
 using std::min;
 using std::unique_ptr;
+using stdx::make_unique;
 
 static const int N = 50;
 
 /* Populate a QueuedDataStage and return it.  Caller owns it. */
 QueuedDataStage* getMS(WorkingSet* ws) {
-    unique_ptr<QueuedDataStage> ms(new QueuedDataStage(ws));
+    auto ms = make_unique<QueuedDataStage>(nullptr, ws);
 
     // Put N ADVANCED results into the mock stage, and some other stalling results (YIELD/TIME).
     for (int i = 0; i < N; ++i) {
         ms->pushBack(PlanStage::NEED_TIME);
-        WorkingSetMember wsm;
-        wsm.state = WorkingSetMember::OWNED_OBJ;
-        wsm.obj = Snapshotted<BSONObj>(SnapshotId(), BSON("x" << i));
-        ms->pushBack(wsm);
+
+        WorkingSetID id = ws->allocate();
+        WorkingSetMember* wsm = ws->get(id);
+        wsm->obj = Snapshotted<BSONObj>(SnapshotId(), BSON("x" << i));
+        wsm->transitionToOwnedObj();
+        ms->pushBack(id);
+
         ms->pushBack(PlanStage::NEED_TIME);
     }
 
@@ -89,10 +94,10 @@ public:
         for (int i = 0; i < 2 * N; ++i) {
             WorkingSet ws;
 
-            unique_ptr<PlanStage> skip(new SkipStage(i, &ws, getMS(&ws)));
+            unique_ptr<PlanStage> skip = make_unique<SkipStage>(nullptr, i, &ws, getMS(&ws));
             ASSERT_EQUALS(max(0, N - i), countResults(skip.get()));
 
-            unique_ptr<PlanStage> limit(new LimitStage(i, &ws, getMS(&ws)));
+            unique_ptr<PlanStage> limit = make_unique<LimitStage>(nullptr, i, &ws, getMS(&ws));
             ASSERT_EQUALS(min(N, i), countResults(limit.get()));
         }
     }

@@ -43,7 +43,6 @@ const BSONField<std::string> BatchedInsertRequest::collName("insert");
 const BSONField<std::vector<BSONObj>> BatchedInsertRequest::documents("documents");
 const BSONField<BSONObj> BatchedInsertRequest::writeConcern("writeConcern");
 const BSONField<bool> BatchedInsertRequest::ordered("ordered", true);
-const BSONField<BSONObj> BatchedInsertRequest::metadata("metadata");
 
 BatchedInsertRequest::BatchedInsertRequest() {
     clear();
@@ -58,7 +57,7 @@ bool BatchedInsertRequest::isValid(std::string* errMsg) const {
     }
 
     // All the mandatory fields must be present.
-    if (!_isCollNameSet) {
+    if (!_isNSSet) {
         *errMsg = stream() << "missing " << collName.name() << " field";
         return false;
     }
@@ -74,8 +73,8 @@ bool BatchedInsertRequest::isValid(std::string* errMsg) const {
 BSONObj BatchedInsertRequest::toBSON() const {
     BSONObjBuilder builder;
 
-    if (_isCollNameSet)
-        builder.append(collName(), _collName);
+    if (_isNSSet)
+        builder.append(collName(), _ns.coll());
 
     if (_isDocumentsSet) {
         BSONArrayBuilder documentsBuilder(builder.subarrayStart(documents()));
@@ -92,9 +91,6 @@ BSONObj BatchedInsertRequest::toBSON() const {
     if (_isOrderedSet)
         builder.append(ordered(), _ordered);
 
-    if (_metadata)
-        builder.append(metadata(), _metadata->toBSON());
-
     if (_shouldBypassValidation)
         builder.append(bypassDocumentValidationCommandOption(), true);
 
@@ -105,7 +101,7 @@ static void extractIndexNSS(const BSONObj& indexDesc, NamespaceString* indexNSS)
     *indexNSS = NamespaceString(indexDesc["ns"].str());
 }
 
-bool BatchedInsertRequest::parseBSON(const BSONObj& source, string* errMsg) {
+bool BatchedInsertRequest::parseBSON(StringData dbName, const BSONObj& source, string* errMsg) {
     clear();
 
     std::string dummy;
@@ -123,8 +119,8 @@ bool BatchedInsertRequest::parseBSON(const BSONObj& source, string* errMsg) {
                 FieldParser::extract(sourceEl, collName, &temp, errMsg);
             if (fieldState == FieldParser::FIELD_INVALID)
                 return false;
-            _collName = NamespaceString(temp);
-            _isCollNameSet = fieldState == FieldParser::FIELD_SET;
+            _ns = NamespaceString(dbName, temp);
+            _isNSSet = fieldState == FieldParser::FIELD_SET;
         } else if (documents() == sourceEl.fieldName()) {
             FieldParser::FieldState fieldState =
                 FieldParser::extract(sourceEl, documents, &_documents, errMsg);
@@ -145,19 +141,6 @@ bool BatchedInsertRequest::parseBSON(const BSONObj& source, string* errMsg) {
             if (fieldState == FieldParser::FIELD_INVALID)
                 return false;
             _isOrderedSet = fieldState == FieldParser::FIELD_SET;
-        } else if (metadata() == sourceEl.fieldName()) {
-            BSONObj metadataObj;
-            FieldParser::FieldState fieldState =
-                FieldParser::extract(sourceEl, metadata, &metadataObj, errMsg);
-            if (fieldState == FieldParser::FIELD_INVALID)
-                return false;
-
-            if (!metadataObj.isEmpty()) {
-                _metadata.reset(new BatchedRequestMetadata());
-                if (!_metadata->parseBSON(metadataObj, errMsg)) {
-                    return false;
-                }
-            }
         } else if (bypassDocumentValidationCommandOption() == sourceEl.fieldNameStringData()) {
             _shouldBypassValidation = sourceEl.trueValue();
         }
@@ -167,9 +150,9 @@ bool BatchedInsertRequest::parseBSON(const BSONObj& source, string* errMsg) {
 }
 
 void BatchedInsertRequest::clear() {
-    _collName = NamespaceString();
+    _ns = NamespaceString();
     _targetNSS = NamespaceString();
-    _isCollNameSet = false;
+    _isNSSet = false;
 
     _documents.clear();
     _isDocumentsSet = false;
@@ -181,16 +164,14 @@ void BatchedInsertRequest::clear() {
     _isOrderedSet = false;
 
     _shouldBypassValidation = false;
-
-    _metadata.reset();
 }
 
 void BatchedInsertRequest::cloneTo(BatchedInsertRequest* other) const {
     other->clear();
 
-    other->_collName = _collName;
+    other->_ns = _ns;
     other->_targetNSS = _targetNSS;
-    other->_isCollNameSet = _isCollNameSet;
+    other->_isNSSet = _isNSSet;
 
     for (std::vector<BSONObj>::const_iterator it = _documents.begin(); it != _documents.end();
          ++it) {
@@ -203,38 +184,23 @@ void BatchedInsertRequest::cloneTo(BatchedInsertRequest* other) const {
 
     other->_ordered = _ordered;
     other->_isOrderedSet = _isOrderedSet;
-
-    if (_metadata) {
-        other->_metadata.reset(new BatchedRequestMetadata());
-        _metadata->cloneTo(other->_metadata.get());
-    }
 }
 
 std::string BatchedInsertRequest::toString() const {
     return toBSON().toString();
 }
 
-void BatchedInsertRequest::setCollName(StringData collName) {
-    _collName = NamespaceString(collName);
-    _isCollNameSet = true;
+void BatchedInsertRequest::setNS(NamespaceString ns) {
+    _ns = std::move(ns);
+    _isNSSet = true;
 }
 
-const std::string& BatchedInsertRequest::getCollName() const {
-    dassert(_isCollNameSet);
-    return _collName.ns();
+const NamespaceString& BatchedInsertRequest::getNS() const {
+    dassert(_isNSSet);
+    return _ns;
 }
 
-void BatchedInsertRequest::setCollNameNS(const NamespaceString& collName) {
-    _collName = collName;
-    _isCollNameSet = true;
-}
-
-const NamespaceString& BatchedInsertRequest::getCollNameNS() const {
-    dassert(_isCollNameSet);
-    return _collName;
-}
-
-const NamespaceString& BatchedInsertRequest::getTargetingNSS() const {
+const NamespaceString& BatchedInsertRequest::getIndexTargetingNS() const {
     return _targetNSS;
 }
 
@@ -309,21 +275,4 @@ bool BatchedInsertRequest::getOrdered() const {
         return ordered.getDefault();
     }
 }
-
-void BatchedInsertRequest::setMetadata(BatchedRequestMetadata* metadata) {
-    _metadata.reset(metadata);
-}
-
-void BatchedInsertRequest::unsetMetadata() {
-    _metadata.reset();
-}
-
-bool BatchedInsertRequest::isMetadataSet() const {
-    return _metadata.get();
-}
-
-BatchedRequestMetadata* BatchedInsertRequest::getMetadata() const {
-    return _metadata.get();
-}
-
 }  // namespace mongo

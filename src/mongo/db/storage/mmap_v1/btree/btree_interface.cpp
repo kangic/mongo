@@ -146,7 +146,7 @@ public:
         void setEndPosition(const BSONObj& key, bool inclusive) override {
             if (key.isEmpty()) {
                 // This means scan to end of index.
-                _endState = {};
+                _endState = boost::none;
                 return;
             }
 
@@ -196,9 +196,7 @@ public:
             return curr(parts);
         }
 
-        void savePositioned() override {
-            _txn = nullptr;
-
+        void save() override {
             if (!_lastMoveWasRestore)
                 _savedEOF = isEOF();
 
@@ -215,8 +213,7 @@ public:
         }
 
         void saveUnpositioned() override {
-            _txn = nullptr;
-            // Don't leak our registration if savePositioned() was previously called.
+            // Don't leak our registration if save() was previously called.
             if (!_saved.bucket.isNull())
                 _btree->savedCursors()->unregisterCursor(&_saved);
 
@@ -224,11 +221,7 @@ public:
             _savedEOF = true;
         }
 
-        void restore(OperationContext* txn) override {
-            // guard against accidental double restore
-            invariant(!_txn);
-            _txn = txn;
-
+        void restore() override {
             // Always do a full seek on restore. We cannot use our last position since index
             // entries may have been inserted closer to our endpoint and we would need to move
             // over them.
@@ -249,6 +242,14 @@ public:
 
             _lastMoveWasRestore = isEOF()  // We weren't EOF but now are.
                 || getDiskLoc() != _saved.loc || compareKeys(getKey(), _saved.key) != 0;
+        }
+
+        void detachFromOperationContext() final {
+            _txn = nullptr;
+        }
+
+        void reattachToOperationContext(OperationContext* txn) final {
+            _txn = txn;
         }
 
     private:

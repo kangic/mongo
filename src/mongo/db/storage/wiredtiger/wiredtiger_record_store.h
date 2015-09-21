@@ -31,6 +31,7 @@
 
 #pragma once
 
+#include <boost/thread/mutex.hpp>
 #include <set>
 #include <string>
 
@@ -39,6 +40,7 @@
 #include "mongo/db/storage/record_store.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/stdx/mutex.h"
+#include "mongo/util/concurrency/synchronization.h"
 #include "mongo/util/fail_point_service.h"
 
 /**
@@ -86,8 +88,8 @@ public:
                           bool isCapped = false,
                           int64_t cappedMaxSize = -1,
                           int64_t cappedMaxDocs = -1,
-                          CappedDocumentDeleteCallback* cappedDeleteCallback = NULL,
-                          WiredTigerSizeStorer* sizeStorer = NULL);
+                          CappedCallback* cappedCallback = nullptr,
+                          WiredTigerSizeStorer* sizeStorer = nullptr);
 
     virtual ~WiredTigerRecordStore();
 
@@ -130,13 +132,16 @@ public:
 
     virtual bool updateWithDamagesSupported() const;
 
-    virtual Status updateWithDamages(OperationContext* txn,
-                                     const RecordId& loc,
-                                     const RecordData& oldRec,
-                                     const char* damageSource,
-                                     const mutablebson::DamageVector& damages);
+    virtual StatusWith<RecordData> updateWithDamages(OperationContext* txn,
+                                                     const RecordId& loc,
+                                                     const RecordData& oldRec,
+                                                     const char* damageSource,
+                                                     const mutablebson::DamageVector& damages);
 
-    std::unique_ptr<RecordCursor> getCursor(OperationContext* txn, bool forward) const final;
+    std::unique_ptr<SeekableRecordCursor> getCursor(OperationContext* txn,
+                                                    bool forward) const final;
+    std::unique_ptr<RecordCursor> getRandomCursor(OperationContext* txn) const final;
+
     std::vector<std::unique_ptr<RecordCursor>> getManyCursors(OperationContext* txn) const final;
 
     virtual Status truncate(OperationContext* txn);
@@ -182,8 +187,8 @@ public:
         return _useOplogHack;
     }
 
-    void setCappedDeleteCallback(CappedDocumentDeleteCallback* cb) {
-        _cappedDeleteCallback = cb;
+    void setCappedCallback(CappedCallback* cb) {
+        _cappedCallback = cb;
     }
     int64_t cappedMaxDocs() const;
     int64_t cappedMaxSize() const;
@@ -191,28 +196,42 @@ public:
     const std::string& getURI() const {
         return _uri;
     }
-    uint64_t instanceId() const {
-        return _instanceId;
+    uint64_t tableId() const {
+        return _tableId;
     }
 
     void setSizeStorer(WiredTigerSizeStorer* ss) {
         _sizeStorer = ss;
     }
 
-    void dealtWithCappedLoc(const RecordId& loc);
     bool isCappedHidden(const RecordId& loc) const;
+    RecordId lowestCappedHiddenRecord() const;
 
     bool inShutdown() const;
+
+    void reclaimOplog(OperationContext* txn);
+
     int64_t cappedDeleteAsNeeded(OperationContext* txn, const RecordId& justInserted);
 
     int64_t cappedDeleteAsNeeded_inlock(OperationContext* txn, const RecordId& justInserted);
 
-    stdx::timed_mutex& cappedDeleterMutex() {
+    boost::timed_mutex& cappedDeleterMutex() {  // NOLINT
         return _cappedDeleterMutex;
     }
 
+    // Returns false if the oplog was dropped while waiting for a deletion request.
+    bool yieldAndAwaitOplogDeletionRequest(OperationContext* txn);
+
+    class OplogStones;
+
+    // Exposed only for testing.
+    OplogStones* oplogStones() {
+        return _oplogStones.get();
+    };
+
 private:
     class Cursor;
+    class RandomCursor;
 
     class CappedInsertChange;
     class NumRecordsChange;
@@ -223,31 +242,34 @@ private:
     static int64_t _makeKey(const RecordId& loc);
     static RecordId _fromKey(int64_t k);
 
+    void _dealtWithCappedLoc(const RecordId& loc);
     void _addUncommitedDiskLoc_inlock(OperationContext* txn, const RecordId& loc);
 
     RecordId _nextId();
     void _setId(RecordId loc);
     bool cappedAndNeedDelete() const;
     void _changeNumRecords(OperationContext* txn, int64_t diff);
-    void _increaseDataSize(OperationContext* txn, int amount);
+    void _increaseDataSize(OperationContext* txn, int64_t amount);
     RecordData _getData(const WiredTigerCursor& cursor) const;
-    StatusWith<RecordId> extractAndCheckLocForOplog(const char* data, int len);
     void _oplogSetStartHack(WiredTigerRecoveryUnit* wru) const;
 
     const std::string _uri;
-    const uint64_t _instanceId;  // not persisted
+    const uint64_t _tableId;  // not persisted
 
     // The capped settings should not be updated once operations have started
     const bool _isCapped;
+    // True if the namespace of this record store starts with "local.oplog.", and false otherwise.
     const bool _isOplog;
     const int64_t _cappedMaxSize;
     const int64_t _cappedMaxSizeSlack;  // when to start applying backpressure
     const int64_t _cappedMaxDocs;
     AtomicInt64 _cappedSleep;
     AtomicInt64 _cappedSleepMS;
-    CappedDocumentDeleteCallback* _cappedDeleteCallback;
-    int _cappedDeleteCheckCount;                    // see comment in ::cappedDeleteAsNeeded
-    mutable stdx::timed_mutex _cappedDeleterMutex;  // see comment in ::cappedDeleteAsNeeded
+    CappedCallback* _cappedCallback;
+
+    // See comment in ::cappedDeleteAsNeeded
+    int _cappedDeleteCheckCount;
+    mutable boost::timed_mutex _cappedDeleterMutex;  // NOLINT
 
     const bool _useOplogHack;
 
@@ -265,7 +287,9 @@ private:
     int _sizeStorerCounter;
 
     bool _shuttingDown;
-    bool _hasBackgroundThread;
+
+    // Non-null if this record store is underlying the active oplog.
+    std::shared_ptr<OplogStones> _oplogStones;
 };
 
 // WT failpoint to throw write conflict exceptions randomly

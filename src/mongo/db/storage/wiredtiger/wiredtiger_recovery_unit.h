@@ -39,6 +39,7 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/record_id.h"
 #include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/storage/snapshot_name.h"
 #include "mongo/util/concurrency/ticketholder.h"
 #include "mongo/util/timer.h"
 
@@ -48,7 +49,7 @@ class BSONObjBuilder;
 class WiredTigerSession;
 class WiredTigerSessionCache;
 
-class WiredTigerRecoveryUnit : public RecoveryUnit {
+class WiredTigerRecoveryUnit final : public RecoveryUnit {
 public:
     WiredTigerRecoveryUnit(WiredTigerSessionCache* sc);
 
@@ -61,12 +62,8 @@ public:
     void abortUnitOfWork() final;
 
     virtual bool waitUntilDurable();
-    virtual void goingToWaitUntilDurable();
 
-    virtual void registerChange(Change*);
-
-    virtual void beingReleasedFromOperationContext();
-    virtual void beingSetOnOperationContext();
+    virtual void registerChange(Change* change);
 
     virtual void abandonSnapshot();
 
@@ -78,6 +75,13 @@ public:
     virtual void setRollbackWritesDisabled() {}
 
     virtual SnapshotId getSnapshotId() const;
+
+    Status setReadFromMajorityCommittedSnapshot() final;
+    bool isReadingFromMajorityCommittedSnapshot() const final {
+        return _readFromMajorityCommittedSnapshot;
+    }
+
+    boost::optional<SnapshotName> getMajorityCommittedSnapshot() const final;
 
     // ---- WT STUFF
 
@@ -105,24 +109,34 @@ public:
 
     static void appendGlobalStats(BSONObjBuilder& b);
 
+    /**
+     * Prepares this RU to be the basis for a named snapshot.
+     *
+     * Begins a WT transaction, and invariants if we are already in one.
+     * Bans being in a WriteUnitOfWork until the next call to commitAndRestart().
+     */
+    void prepareForCreateSnapshot(OperationContext* opCtx);
+
 private:
     void _abort();
     void _commit();
 
+    void _ensureSession();
     void _txnClose(bool commit);
     void _txnOpen(OperationContext* opCtx);
 
     WiredTigerSessionCache* _sessionCache;  // not owned
     WiredTigerSession* _session;            // owned, but from pool
     bool _defaultCommit;
+    bool _areWriteUnitOfWorksBanned = false;
     bool _inUnitOfWork;
     bool _active;
     uint64_t _myTransactionCount;
     bool _everStartedWrite;
     Timer _timer;
-    bool _currentlySquirreled;
-    bool _syncing;
     RecordId _oplogReadTill;
+    bool _readFromMajorityCommittedSnapshot = false;
+    SnapshotName _majorityCommittedSnapshot = SnapshotName::min();
 
     typedef OwnedPointerVector<Change> Changes;
     Changes _changes;
@@ -138,7 +152,7 @@ private:
 class WiredTigerCursor {
 public:
     WiredTigerCursor(const std::string& uri,
-                     uint64_t uriID,
+                     uint64_t tableID,
                      bool forRecordStore,
                      OperationContext* txn);
 
@@ -166,7 +180,7 @@ public:
     }
 
 private:
-    uint64_t _uriID;
+    uint64_t _tableID;
     WiredTigerRecoveryUnit* _ru;  // not owned
     WiredTigerSession* _session;
     WT_CURSOR* _cursor;  // owned, but pulled

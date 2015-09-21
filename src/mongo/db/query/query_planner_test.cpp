@@ -65,6 +65,15 @@ TEST_F(QueryPlannerTest, EqualityIndexScanWithTrailingFields) {
     assertSolutionExists("{fetch: {filter: null, node: {ixscan: {pattern: {x: 1, y: 1}}}}}");
 }
 
+// $eq can use a hashed index because it looks for values of type regex;
+// it doesn't evaluate the regex itself.
+TEST_F(QueryPlannerTest, EqCanUseHashedIndexWithRegex) {
+    addIndex(BSON("a"
+                  << "hashed"));
+    runQuery(fromjson("{a: {$eq: /abc/}}"));
+    ASSERT_EQUALS(getNumSolutions(), 2U);
+}
+
 //
 // indexFilterApplied
 // Check that index filter flag is passed from planner params
@@ -706,6 +715,128 @@ TEST_F(QueryPlannerTest, OrOfAnd6) {
         " b: [[1,1,true,true], [5,5,true,true]]}}}]}}}}");
 }
 
+// We do collapse OR of ANDs if branches of the OR plan are using identical index scans.
+TEST_F(QueryPlannerTest, RootedOrOfAndCollapseIndenticalScans) {
+    addIndex(BSON("a" << 1 << "b" << 1));
+    runQuery(fromjson("{$or: [{a:1, b:2}, {a:1, b:2}]}"));
+
+    assertNumSolutions(2U);
+    assertSolutionExists("{cscan: {dir: 1}}");
+    assertSolutionExists(
+        "{fetch: {filter: null, node: {ixscan: {pattern: {a: 1, b: 1}},"
+        "bounds: {a: [[1,1,true,true]], b: [[2,2,true,true]]},"
+        "filter: null}}}");
+}
+
+TEST_F(QueryPlannerTest, ContainedOrOfAndCollapseIndenticalScans) {
+    addIndex(BSON("a" << 1 << "b" << 1));
+    runQuery(fromjson("{c: 1, $or: [{a:1, b:2}, {a:1, b:2}]}"));
+
+    assertNumSolutions(2U);
+    assertSolutionExists("{cscan: {dir: 1}}");
+    assertSolutionExists(
+        "{fetch: {filter: {c: 1}, node: {ixscan: {pattern: {a: 1, b: 1}},"
+        "bounds: {a: [[1,1,true,true]], b: [[2,2,true,true]]},"
+        "filter: null}}}");
+}
+
+TEST_F(QueryPlannerTest, ContainedOrOfAndCollapseIndenticalScansWithFilter) {
+    addIndex(BSON("a" << 1 << "b" << 1));
+    runQuery(fromjson("{c: 1, $or: [{a:1, b:2}, {a:1, b:2, d:3}]}"));
+
+    assertNumSolutions(2U);
+    assertSolutionExists("{cscan: {dir: 1}}");
+    assertSolutionExists(
+        "{fetch: {filter: {c: 1}, node: {ixscan: {pattern: {a: 1, b: 1}},"
+        "bounds: {a: [[1,1,true,true]], b: [[2,2,true,true]]},"
+        "filter: null}}}");
+}
+
+TEST_F(QueryPlannerTest, ContainedOrOfAndCollapseIndenticalScansWithFilter2) {
+    addIndex(BSON("a" << 1 << "b" << 1));
+    runQuery(fromjson("{c: 1, $or: [{a:{$gte:1,$lte:1}, b:2}, {a:1, b:2, d:3}]}"));
+
+    assertNumSolutions(2U);
+    assertSolutionExists("{cscan: {dir: 1}}");
+    assertSolutionExists(
+        "{fetch: {filter: {c: 1}, node: {fetch: {filter: null, node: "
+        "{ixscan: {pattern: {a: 1, b: 1}},"
+        "bounds: {a: [[1,1,true,true]], b: [[2,2,true,true]]},"
+        "filter: null}}}}}");
+}
+
+TEST_F(QueryPlannerTest, ContainedOrOfAndCollapseIdenticalScansTwoFilters) {
+    addIndex(BSON("a" << 1 << "b" << 1));
+    runQuery(fromjson("{c: 1, $or: [{a:1, b:2, d:3}, {a:1, b:2, e:4}]}"));
+
+    assertNumSolutions(2U);
+    assertSolutionExists("{cscan: {dir: 1}}");
+    assertSolutionExists(
+        "{fetch: {filter: {c: 1}, node: {fetch: {filter: {$or:[{e:4},{d:3}]},"
+        "node: {ixscan: {pattern: {a: 1, b: 1}, filter: null,"
+        "bounds: {a: [[1,1,true,true]], b: [[2,2,true,true]]}}}}}}}");
+}
+
+TEST_F(QueryPlannerTest, RootedOrOfAndCollapseScansExistingOrFilter) {
+    addIndex(BSON("a" << 1 << "b" << 1));
+    runQuery(fromjson("{$or: [{a:1, b:2, $or: [{c:3}, {d:4}]}, {a:1, b:2, e:5}]}"));
+
+    assertNumSolutions(2U);
+    assertSolutionExists("{cscan: {dir: 1}}");
+    assertSolutionExists(
+        "{fetch: {filter: {$or: [{e:5},{c:3},{d:4}]}, node: {ixscan: "
+        "{filter: null, pattern: {a: 1, b: 1}, "
+        "bounds: {a: [[1,1,true,true]], b: [[2,2,true,true]]}}}}}");
+}
+
+TEST_F(QueryPlannerTest, RootedOrOfAndCollapseTwoScansButNotThird) {
+    addIndex(BSON("a" << 1 << "b" << 1));
+    addIndex(BSON("c" << 1 << "d" << 1));
+    runQuery(fromjson("{$or: [{a: 1, b: 2}, {c: 3, d: 4}, {a: 1, b: 2}]}"));
+
+    assertNumSolutions(2U);
+    assertSolutionExists("{cscan: {dir: 1}}");
+    assertSolutionExists(
+        "{fetch: {filter: null, node: {or: {nodes: ["
+        "{ixscan: {pattern: {a: 1, b: 1}, filter: null,"
+        "bounds: {a: [[1,1,true,true]], b: [[2,2,true,true]]}}},"
+        "{ixscan: {pattern: {c: 1, d: 1}, filter: null,"
+        "bounds: {c: [[3,3,true,true]], d: [[4,4,true,true]]}}}]}}}}");
+}
+
+TEST_F(QueryPlannerTest, RootedOrOfAndCollapseTwoScansButNotThirdWithFilters) {
+    addIndex(BSON("a" << 1 << "b" << 1));
+    addIndex(BSON("c" << 1 << "d" << 1));
+    runQuery(fromjson("{$or: [{a:1, b:2, e:5}, {c:3, d:4}, {a:1, b:2, f:6}]}"));
+
+    assertNumSolutions(2U);
+    assertSolutionExists("{cscan: {dir: 1}}");
+    assertSolutionExists(
+        "{fetch: {filter: null, node: {or: {nodes: ["
+        "{fetch: {filter: {$or: [{f:6},{e:5}]}, node: "
+        "{ixscan: {pattern: {a: 1, b: 1}, filter: null,"
+        "bounds: {a: [[1,1,true,true]], b: [[2,2,true,true]]}}}}},"
+        "{ixscan: {pattern: {c: 1, d: 1}, filter: null,"
+        "bounds: {c: [[3,3,true,true]], d: [[4,4,true,true]]}}}]}}}}");
+}
+
+TEST_F(QueryPlannerTest, RootedOrOfAndDontCollapseDifferentBounds) {
+    addIndex(BSON("a" << 1 << "b" << 1));
+    addIndex(BSON("c" << 1 << "d" << 1));
+    runQuery(fromjson("{$or: [{a: 1, b: 2}, {c: 3, d: 4}, {a: 1, b: 99}]}"));
+
+    assertNumSolutions(2U);
+    assertSolutionExists("{cscan: {dir: 1}}");
+    assertSolutionExists(
+        "{fetch: {filter: null, node: {or: {nodes: ["
+        "{ixscan: {pattern: {a: 1, b: 1}, filter: null,"
+        "bounds: {a: [[1,1,true,true]], b: [[2,2,true,true]]}}},"
+        "{ixscan: {pattern: {a: 1, b: 1}, filter: null,"
+        "bounds: {a: [[1,1,true,true]], b: [[99,99,true,true]]}}},"
+        "{ixscan: {pattern: {c: 1, d: 1}, filter: null,"
+        "bounds: {c: [[3,3,true,true]], d: [[4,4,true,true]]}}}]}}}}");
+}
+
 // SERVER-13960: properly handle $or with a mix of exact and inexact predicates.
 TEST_F(QueryPlannerTest, OrInexactWithExact) {
     addIndex(BSON("name" << 1));
@@ -1066,7 +1197,7 @@ TEST_F(QueryPlannerTest, MaxMinBadHintSelectsReverseIndex) {
 
 
 //
-// $snapshot
+// snapshot
 //
 
 TEST_F(QueryPlannerTest, Snapshot) {
@@ -1074,9 +1205,29 @@ TEST_F(QueryPlannerTest, Snapshot) {
     runQuerySnapshot(fromjson("{a: {$gt: 0}}"));
 
     assertNumSolutions(1U);
+    assertSolutionExists("{cscan: {filter: {a: {$gt: 0}}, dir: 1}}");
+}
+
+TEST_F(QueryPlannerTest, SnapshotUseId) {
+    params.options = QueryPlannerParams::SNAPSHOT_USE_ID;
+
+    addIndex(BSON("a" << 1));
+    runQuerySnapshot(fromjson("{a: {$gt: 0}}"));
+
+    assertNumSolutions(1U);
     assertSolutionExists(
         "{fetch: {filter: {a:{$gt:0}}, node: "
         "{ixscan: {filter: null, pattern: {_id: 1}}}}}");
+}
+
+TEST_F(QueryPlannerTest, CannotSnapshotWithGeoNear) {
+    // Snapshot is skipped with geonear queries.
+    addIndex(BSON("a"
+                  << "2d"));
+    runQuerySnapshot(fromjson("{a: {$near: [0,0]}}"));
+
+    ASSERT_EQUALS(getNumSolutions(), 1U);
+    assertSolutionExists("{geoNear2d: {a: '2d'}}");
 }
 
 //
@@ -1188,8 +1339,8 @@ TEST_F(QueryPlannerTest, BasicSort) {
         "{fetch: {filter: null, node: {ixscan: "
         "{filter: null, pattern: {x: 1}}}}}");
     assertSolutionExists(
-        "{sort: {pattern: {x: 1}, limit: 0, "
-        "node: {cscan: {dir: 1, filter: {}}}}}");
+        "{sort: {pattern: {x: 1}, limit: 0, node: {sortKeyGen:"
+        "{node: {cscan: {dir: 1, filter: {}}}}}}}");
 }
 
 TEST_F(QueryPlannerTest, CantUseHashedIndexToProvideSort) {
@@ -1199,8 +1350,8 @@ TEST_F(QueryPlannerTest, CantUseHashedIndexToProvideSort) {
 
     ASSERT_EQUALS(getNumSolutions(), 1U);
     assertSolutionExists(
-        "{sort: {pattern: {x: 1}, limit: 0, "
-        "node: {cscan: {dir: 1, filter: {}}}}}");
+        "{sort: {pattern: {x: 1}, limit: 0, node: {sortKeyGen:"
+        "{node: {cscan: {dir: 1, filter: {}}}}}}}");
 }
 
 TEST_F(QueryPlannerTest, CantUseHashedIndexToProvideSortWithIndexablePred) {
@@ -1210,12 +1361,12 @@ TEST_F(QueryPlannerTest, CantUseHashedIndexToProvideSortWithIndexablePred) {
 
     ASSERT_EQUALS(getNumSolutions(), 2U);
     assertSolutionExists(
-        "{sort: {pattern: {x: 1}, limit: 0, node: "
+        "{sort: {pattern: {x: 1}, limit: 0, node: {sortKeyGen: {node: "
         "{fetch: {node: "
-        "{ixscan: {pattern: {x: 'hashed'}}}}}}}");
+        "{ixscan: {pattern: {x: 'hashed'}}}}}}}}}");
     assertSolutionExists(
-        "{sort: {pattern: {x: 1}, limit: 0, node: "
-        "{cscan: {dir: 1, filter: {x: {$in: [0, 1]}}}}}}");
+        "{sort: {pattern: {x: 1}, limit: 0, node: {sortKeyGen: {node:"
+        "{cscan: {dir: 1, filter: {x: {$in: [0, 1]}}}}}}}}");
 }
 
 TEST_F(QueryPlannerTest, CantUseTextIndexToProvideSort) {
@@ -1226,8 +1377,8 @@ TEST_F(QueryPlannerTest, CantUseTextIndexToProvideSort) {
 
     ASSERT_EQUALS(getNumSolutions(), 1U);
     assertSolutionExists(
-        "{sort: {pattern: {x: 1}, limit: 0, "
-        "node: {cscan: {dir: 1, filter: {}}}}}");
+        "{sort: {pattern: {x: 1}, limit: 0, node: {sortKeyGen: "
+        "{node: {cscan: {dir: 1, filter: {}}}}}}}");
 }
 
 TEST_F(QueryPlannerTest, BasicSortWithIndexablePred) {
@@ -1237,12 +1388,12 @@ TEST_F(QueryPlannerTest, BasicSortWithIndexablePred) {
 
     ASSERT_EQUALS(getNumSolutions(), 3U);
     assertSolutionExists(
-        "{sort: {pattern: {b: 1}, limit: 0, "
-        "node: {cscan: {dir: 1, filter: {a: 5}}}}}");
+        "{sort: {pattern: {b: 1}, limit: 0, node: {sortKeyGen: "
+        "{node: {cscan: {dir: 1, filter: {a: 5}}}}}}}");
     assertSolutionExists(
-        "{sort: {pattern: {b: 1}, limit: 0, "
-        "node: {fetch: {filter: null, node: "
-        "{ixscan: {filter: null, pattern: {a: 1}}}}}}}");
+        "{sort: {pattern: {b: 1}, limit: 0, node: {sortKeyGen: "
+        "{node: {fetch: {filter: null, node: "
+        "{ixscan: {filter: null, pattern: {a: 1}}}}}}}}}");
     assertSolutionExists(
         "{fetch: {filter: {a: 5}, node: {ixscan: "
         "{filter: null, pattern: {b: 1}}}}}");
@@ -1254,8 +1405,8 @@ TEST_F(QueryPlannerTest, BasicSortBooleanIndexKeyPattern) {
 
     ASSERT_EQUALS(getNumSolutions(), 2U);
     assertSolutionExists(
-        "{sort: {pattern: {a: 1}, limit: 0, "
-        "node: {cscan: {dir: 1, filter: {a: 5}}}}}");
+        "{sort: {pattern: {a: 1}, limit: 0, node: {sortKeyGen: "
+        "{node: {cscan: {dir: 1, filter: {a: 5}}}}}}}");
     assertSolutionExists(
         "{fetch: {filter: null, node: {ixscan: "
         "{filter: null, pattern: {a: true}}}}}");
@@ -1283,8 +1434,8 @@ TEST_F(QueryPlannerTest, SortLimit) {
     runQuerySortProjSkipLimit(BSONObj(), fromjson("{a: 1}"), BSONObj(), 0, -3);
     assertNumSolutions(1U);
     assertSolutionExists(
-        "{sort: {pattern: {a: 1}, limit: 3, "
-        "node: {cscan: {dir: 1}}}}");
+        "{sort: {pattern: {a: 1}, limit: 3, node: {sortKeyGen: "
+        "{node: {cscan: {dir: 1}}}}}}");
 }
 
 TEST_F(QueryPlannerTest, SortSkip) {
@@ -1293,8 +1444,8 @@ TEST_F(QueryPlannerTest, SortSkip) {
     // If only skip is provided, do not limit sort.
     assertSolutionExists(
         "{skip: {n: 2, node: "
-        "{sort: {pattern: {a: 1}, limit: 0, "
-        "node: {cscan: {dir: 1}}}}}}");
+        "{sort: {pattern: {a: 1}, limit: 0, node: {sortKeyGen: "
+        "{node: {cscan: {dir: 1}}}}}}}}");
 }
 
 TEST_F(QueryPlannerTest, SortSkipLimit) {
@@ -1303,16 +1454,16 @@ TEST_F(QueryPlannerTest, SortSkipLimit) {
     // Limit in sort node should be adjusted by skip count
     assertSolutionExists(
         "{skip: {n: 2, node: "
-        "{sort: {pattern: {a: 1}, limit: 5, "
-        "node: {cscan: {dir: 1}}}}}}");
+        "{sort: {pattern: {a: 1}, limit: 5, node: {sortKeyGen: "
+        "{node: {cscan: {dir: 1}}}}}}}}");
 }
 
 TEST_F(QueryPlannerTest, SortSoftLimit) {
     runQuerySortProjSkipLimit(BSONObj(), fromjson("{a: 1}"), BSONObj(), 0, 3);
     assertNumSolutions(1U);
     assertSolutionExists(
-        "{sort: {pattern: {a: 1}, limit: 3, "
-        "node: {cscan: {dir: 1}}}}");
+        "{sort: {pattern: {a: 1}, limit: 3, node: {sortKeyGen: "
+        "{node: {cscan: {dir: 1}}}}}}");
 }
 
 TEST_F(QueryPlannerTest, SortSkipSoftLimit) {
@@ -1320,8 +1471,8 @@ TEST_F(QueryPlannerTest, SortSkipSoftLimit) {
     assertNumSolutions(1U);
     assertSolutionExists(
         "{skip: {n: 2, node: "
-        "{sort: {pattern: {a: 1}, limit: 5, "
-        "node: {cscan: {dir: 1}}}}}}");
+        "{sort: {pattern: {a: 1}, limit: 5, node: {sortKeyGen: "
+        "{node: {cscan: {dir: 1}}}}}}}}");
 }
 
 //
@@ -1335,8 +1486,8 @@ TEST_F(QueryPlannerTest, BasicSortElim) {
 
     ASSERT_EQUALS(getNumSolutions(), 2U);
     assertSolutionExists(
-        "{sort: {pattern: {x: 1}, limit: 0, "
-        "node: {cscan: {dir: 1, filter: {x: {$gt: 1}}}}}}");
+        "{sort: {pattern: {x: 1}, limit: 0, node: {sortKeyGen: "
+        "{node: {cscan: {dir: 1, filter: {x: {$gt: 1}}}}}}}}");
     assertSolutionExists(
         "{fetch: {filter: null, node: {ixscan: {filter: null, pattern: {x: 1}}}}}");
 }
@@ -1347,8 +1498,8 @@ TEST_F(QueryPlannerTest, SortElimCompound) {
 
     ASSERT_EQUALS(getNumSolutions(), 2U);
     assertSolutionExists(
-        "{sort: {pattern: {b: 1}, limit: 0, "
-        "node: {cscan: {dir: 1, filter: {a: 5}}}}}");
+        "{sort: {pattern: {b: 1}, limit: 0, node: {sortKeyGen: "
+        "{node: {cscan: {dir: 1, filter: {a: 5}}}}}}}");
     assertSolutionExists(
         "{fetch: {filter: null, node: {ixscan: "
         "{filter: null, pattern: {a: 1, b: 1}}}}}");
@@ -1362,8 +1513,8 @@ TEST_F(QueryPlannerTest, SortElimTrailingFields) {
 
     ASSERT_EQUALS(getNumSolutions(), 2U);
     assertSolutionExists(
-        "{sort: {pattern: {b: 1}, limit: 0, "
-        "node: {cscan: {dir: 1, filter: {a: 5}}}}}");
+        "{sort: {pattern: {b: 1}, limit: 0, node: {sortKeyGen: "
+        "{node: {cscan: {dir: 1, filter: {a: 5}}}}}}}");
     assertSolutionExists(
         "{fetch: {filter: null, node: {ixscan: "
         "{filter: null, pattern: {a: 1, b: 1, c: 1}}}}}");
@@ -1376,8 +1527,8 @@ TEST_F(QueryPlannerTest, SortElimTrailingFieldsReverse) {
 
     ASSERT_EQUALS(getNumSolutions(), 2U);
     assertSolutionExists(
-        "{sort: {pattern: {c: -1}, limit: 0, "
-        "node: {cscan: {dir: 1, filter: {a: 5, b: 6}}}}}");
+        "{sort: {pattern: {c: -1}, limit: 0, node: {sortKeyGen: "
+        "{node: {cscan: {dir: 1, filter: {a: 5, b: 6}}}}}}}");
     assertSolutionExists(
         "{fetch: {filter: null, node: {ixscan: "
         "{filter: null, dir: -1, pattern: {a: 1, b: 1, c: 1, d: 1}}}}}");
@@ -1525,8 +1676,8 @@ TEST_F(QueryPlannerTest, InWithSort) {
     runQuerySortProjSkipLimit(fromjson("{a: {$in: [1, 2]}}"), BSON("b" << 1), BSONObj(), 0, 1);
 
     assertSolutionExists(
-        "{sort: {pattern: {b: 1}, limit: 1, "
-        "node: {cscan: {dir: 1}}}}");
+        "{sort: {pattern: {b: 1}, limit: 1, node: {sortKeyGen: "
+        "{node: {cscan: {dir: 1}}}}}}");
     assertSolutionExists(
         "{fetch: {node: {mergeSort: {nodes: "
         "[{ixscan: {pattern: {a: 1, b: 1}}}, {ixscan: {pattern: {a: 1, b: 1}}}]}}}}");
@@ -1552,8 +1703,8 @@ TEST_F(QueryPlannerTest, ManyInWithSort) {
                               1);
 
     assertSolutionExists(
-        "{sort: {pattern: {d: 1}, limit: 1, "
-        "node: {cscan: {dir: 1}}}}");
+        "{sort: {pattern: {d: 1}, limit: 1, node: {sortKeyGen: "
+        "{node: {cscan: {dir: 1}}}}}}");
     assertSolutionExists(
         "{fetch: {node: {mergeSort: {nodes: "
         "[{ixscan: {pattern: {a: 1, b: 1, c:1, d:1}}},"
@@ -1579,11 +1730,11 @@ TEST_F(QueryPlannerTest, TooManyToExplode) {
     // We cap the # of ixscans we're willing to create.
     assertNumSolutions(2);
     assertSolutionExists(
-        "{sort: {pattern: {d: 1}, limit: 1, "
-        "node: {cscan: {dir: 1}}}}");
+        "{sort: {pattern: {d: 1}, limit: 1, node: {sortKeyGen: "
+        "{node: {cscan: {dir: 1}}}}}}");
     assertSolutionExists(
-        "{sort: {pattern: {d: 1}, limit: 1, node: "
-        "{fetch: {node: {ixscan: {pattern: {a: 1, b: 1, c:1, d:1}}}}}}}");
+        "{sort: {pattern: {d: 1}, limit: 1, node: {sortKeyGen: {node: "
+        "{fetch: {node: {ixscan: {pattern: {a: 1, b: 1, c:1, d:1}}}}}}}}}");
 }
 
 TEST_F(QueryPlannerTest, CantExplodeMetaSort) {
@@ -1596,8 +1747,8 @@ TEST_F(QueryPlannerTest, CantExplodeMetaSort) {
     assertNumSolutions(1U);
     assertSolutionExists(
         "{proj: {spec: {c:{$meta:'textScore'}}, node: "
-        "{sort: {pattern: {c:{$meta:'textScore'}}, limit: 0, node: "
-        "{cscan: {filter: {a:{$in:[1,2]},b:{$in:[3,4]}}, dir: 1}}}}}}");
+        "{sort: {pattern: {c:{$meta:'textScore'}}, limit: 0, node: {sortKeyGen: {node: "
+        "{cscan: {filter: {a:{$in:[1,2]},b:{$in:[3,4]}}, dir: 1}}}}}}}}");
 }
 
 // SERVER-13618: test that exploding scans for sort works even
@@ -1607,7 +1758,9 @@ TEST_F(QueryPlannerTest, ExplodeMustReverseScans) {
     runQuerySortProj(fromjson("{a: {$in: [1, 2]}, b: {$in: [3, 4]}}"), BSON("c" << -1), BSONObj());
 
     assertNumSolutions(2U);
-    assertSolutionExists("{sort: {pattern: {c: -1}, limit: 0, node: {cscan: {dir: 1}}}}");
+    assertSolutionExists(
+        "{sort: {pattern: {c: -1}, limit: 0, node: {sortKeyGen: {node: "
+        "{cscan: {dir: 1}}}}}}");
     assertSolutionExists(
         "{fetch: {node: {mergeSort: {nodes: "
         "[{ixscan: {pattern: {a:1, b:1, c:1, d:1}}},"
@@ -1622,7 +1775,9 @@ TEST_F(QueryPlannerTest, ExplodeMustReverseScans2) {
     runQuerySortProj(fromjson("{a: {$in: [1, 2]}, b: {$in: [3, 4]}}"), BSON("c" << 1), BSONObj());
 
     assertNumSolutions(2U);
-    assertSolutionExists("{sort: {pattern: {c: 1}, limit: 0, node: {cscan: {dir: 1}}}}");
+    assertSolutionExists(
+        "{sort: {pattern: {c: 1}, limit: 0, node: {sortKeyGen: {node: "
+        "{cscan: {dir: 1}}}}}}");
     assertSolutionExists(
         "{fetch: {node: {mergeSort: {nodes: "
         "[{ixscan: {pattern: {a:1, b:1, c:-1}}},"
@@ -1638,10 +1793,12 @@ TEST_F(QueryPlannerTest, CantExplodeWithEmptyBounds) {
     runQuerySortProj(fromjson("{a: {$in: []}}"), BSON("b" << 1), BSONObj());
 
     assertNumSolutions(2U);
-    assertSolutionExists("{sort: {pattern: {b:1}, limit: 0, node: {cscan: {dir: 1}}}}");
     assertSolutionExists(
-        "{sort: {pattern: {b:1}, limit: 0, node: "
-        "{fetch: {node: {ixscan: {pattern: {a: 1, b: 1}}}}}}}");
+        "{sort: {pattern: {b:1}, limit: 0, node: {sortKeyGen: {node: "
+        "{cscan: {dir: 1}}}}}}");
+    assertSolutionExists(
+        "{sort: {pattern: {b:1}, limit: 0, node: {sortKeyGen: {node: "
+        "{fetch: {node: {ixscan: {pattern: {a: 1, b: 1}}}}}}}}}");
 }
 
 // SERVER-13752
@@ -1650,10 +1807,12 @@ TEST_F(QueryPlannerTest, CantExplodeWithEmptyBounds2) {
     runQuerySortProj(fromjson("{a: {$gt: 3, $lt: 0}}"), BSON("b" << 1), BSONObj());
 
     assertNumSolutions(2U);
-    assertSolutionExists("{sort: {pattern: {b:1}, limit: 0, node: {cscan: {dir: 1}}}}");
     assertSolutionExists(
-        "{sort: {pattern: {b:1}, limit: 0, node: "
-        "{fetch: {node: {ixscan: {pattern: {a:1,b:1,c:1}}}}}}}");
+        "{sort: {pattern: {b:1}, limit: 0, node: {sortKeyGen: {node: "
+        "{cscan: {dir: 1}}}}}}");
+    assertSolutionExists(
+        "{sort: {pattern: {b:1}, limit: 0, node: {sortKeyGen: {node: "
+        "{fetch: {node: {ixscan: {pattern: {a:1,b:1,c:1}}}}}}}}}");
 }
 
 // SERVER-13754: exploding an $or
@@ -1664,7 +1823,9 @@ TEST_F(QueryPlannerTest, ExplodeOrForSort) {
     runQuerySortProj(fromjson("{$or: [{a: 1}, {a: 2}, {b: 2}]}"), BSON("c" << 1), BSONObj());
 
     assertNumSolutions(2U);
-    assertSolutionExists("{sort: {pattern: {c: 1}, limit: 0, node: {cscan: {dir: 1}}}}");
+    assertSolutionExists(
+        "{sort: {pattern: {c: 1}, limit: 0, node: {sortKeyGen: {node: "
+        "{cscan: {dir: 1}}}}}}");
     assertSolutionExists(
         "{fetch: {node: {mergeSort: {nodes: "
         "[{ixscan: {bounds: {a: [[1,1,true,true]], "
@@ -1687,7 +1848,9 @@ TEST_F(QueryPlannerTest, ExplodeOrForSort2) {
         fromjson("{$or: [{a: 1, b: {$in: [1, 2]}}, {d: 3}]}"), BSON("c" << 1), BSONObj());
 
     assertNumSolutions(2U);
-    assertSolutionExists("{sort: {pattern: {c: 1}, limit: 0, node: {cscan: {dir: 1}}}}");
+    assertSolutionExists(
+        "{sort: {pattern: {c: 1}, limit: 0, node: {sortKeyGen: {node: "
+        "{cscan: {dir: 1}}}}}}");
     assertSolutionExists(
         "{fetch: {node: {mergeSort: {nodes: "
         "[{ixscan: {bounds: {a: [[1,1,true,true]], b: [[1,1,true,true]],"
@@ -1710,12 +1873,14 @@ TEST_F(QueryPlannerTest, CantExplodeOrForSort) {
     runQuerySortProj(fromjson("{$or: [{a: {$in: [1, 2]}}, {d: 3}]}"), BSON("c" << 1), BSONObj());
 
     assertNumSolutions(2U);
-    assertSolutionExists("{sort: {pattern: {c: 1}, limit: 0, node: {cscan: {dir: 1}}}}");
     assertSolutionExists(
-        "{sort: {pattern: {c: 1}, limit: 0, node: "
+        "{sort: {pattern: {c: 1}, limit: 0, node: {sortKeyGen: {node: "
+        "{cscan: {dir: 1}}}}}}");
+    assertSolutionExists(
+        "{sort: {pattern: {c: 1}, limit: 0, node: {sortKeyGen: {node: "
         "{fetch: {filter: null, node: {or: {nodes: ["
         "{ixscan: {pattern: {a: 1, b: 1, c: 1}}},"
-        "{ixscan: {pattern: {d: 1, c: 1}}}]}}}}}}");
+        "{ixscan: {pattern: {d: 1, c: 1}}}]}}}}}}}}");
 }
 
 // SERVER-15286:  Make sure that at least the explodeForSort() path bails out
@@ -1730,15 +1895,17 @@ TEST_F(QueryPlannerTest, CantExplodeOrForSort2) {
                      BSONObj());
 
     assertNumSolutions(3U);
-    assertSolutionExists("{sort: {pattern: {a: -1}, limit: 0, node: {cscan: {dir: 1}}}}");
+    assertSolutionExists(
+        "{sort: {pattern: {a: -1}, limit: 0, node: {sortKeyGen: {node: "
+        "{cscan: {dir: 1}}}}}}");
     assertSolutionExists("{fetch: {node: {ixscan: {pattern: {a: 1}}}}}");
     assertSolutionExists(
-        "{sort: {pattern: {a: -1}, limit: 0, node: "
+        "{sort: {pattern: {a: -1}, limit: 0, node: {sortKeyGen: {node: "
         "{fetch: {filter: null, node: {or: {nodes: ["
         "{ixscan: {pattern: {a: 1}, bounds: "
         "{a: [[1,3,false,false]]}}},"
         "{ixscan: {pattern: {a: 1}, bounds: "
-        "{a: [[6,10,false,false]]}}}]}}}}}}");
+        "{a: [[6,10,false,false]]}}}]}}}}}}}}");
 }
 
 // SERVER-13754: too many scans in an $or explosion.
@@ -1758,27 +1925,29 @@ TEST_F(QueryPlannerTest, TooManyToExplodeOr) {
     // We cap the # of ixscans we're willing to create, so we don't get explosion. Instead
     // we get 5 different solutions which all use a blocking sort.
     assertNumSolutions(5U);
-    assertSolutionExists("{sort: {pattern: {e: 1}, limit: 0, node: {cscan: {dir: 1}}}}");
     assertSolutionExists(
-        "{sort: {pattern: {e: 1}, limit: 0, node: "
+        "{sort: {pattern: {e: 1}, limit: 0, node: {sortKeyGen: {node: "
+        "{cscan: {dir: 1}}}}}}");
+    assertSolutionExists(
+        "{sort: {pattern: {e: 1}, limit: 0, node: {sortKeyGen: {node: "
         "{or: {nodes: ["
         "{fetch: {node: {ixscan: {pattern: {a: 1, e: 1}}}}},"
-        "{fetch: {node: {ixscan: {pattern: {c: 1, e: 1}}}}}]}}}}");
+        "{fetch: {node: {ixscan: {pattern: {c: 1, e: 1}}}}}]}}}}}}");
     assertSolutionExists(
-        "{sort: {pattern: {e: 1}, limit: 0, node: "
+        "{sort: {pattern: {e: 1}, limit: 0, node: {sortKeyGen: {node: "
         "{or: {nodes: ["
         "{fetch: {node: {ixscan: {pattern: {b: 1, e: 1}}}}},"
-        "{fetch: {node: {ixscan: {pattern: {c: 1, e: 1}}}}}]}}}}");
+        "{fetch: {node: {ixscan: {pattern: {c: 1, e: 1}}}}}]}}}}}}");
     assertSolutionExists(
-        "{sort: {pattern: {e: 1}, limit: 0, node: "
+        "{sort: {pattern: {e: 1}, limit: 0, node: {sortKeyGen: {node: "
         "{or: {nodes: ["
         "{fetch: {node: {ixscan: {pattern: {a: 1, e: 1}}}}},"
-        "{fetch: {node: {ixscan: {pattern: {d: 1, e: 1}}}}}]}}}}");
+        "{fetch: {node: {ixscan: {pattern: {d: 1, e: 1}}}}}]}}}}}}");
     assertSolutionExists(
-        "{sort: {pattern: {e: 1}, limit: 0, node: "
+        "{sort: {pattern: {e: 1}, limit: 0, node: {sortKeyGen: {node: "
         "{or: {nodes: ["
         "{fetch: {node: {ixscan: {pattern: {b: 1, e: 1}}}}},"
-        "{fetch: {node: {ixscan: {pattern: {d: 1, e: 1}}}}}]}}}}");
+        "{fetch: {node: {ixscan: {pattern: {d: 1, e: 1}}}}}]}}}}}}");
 }
 
 // SERVER-15696: Make sure explodeForSort copies filters on IXSCAN stages to all of the
@@ -1794,7 +1963,9 @@ TEST_F(QueryPlannerTest, ExplodeIxscanWithFilter) {
                      BSONObj());
 
     assertNumSolutions(2U);
-    assertSolutionExists("{sort: {pattern: {b: 1}, limit: 0, node: {cscan: {dir: 1}}}}");
+    assertSolutionExists(
+        "{sort: {pattern: {b: 1}, limit: 0, node: {sortKeyGen: {node: "
+        "{cscan: {dir: 1}}}}}}");
     assertSolutionExists(
         "{fetch: {node: {mergeSort: {nodes: "
         "[{ixscan: {pattern: {a:1, b:1},"
@@ -1813,12 +1984,19 @@ TEST_F(QueryPlannerTest, InWithSortAndLimitTrailingField) {
 
     assertNumSolutions(2U);
     assertSolutionExists(
-        "{sort: {pattern: {b:-1}, limit: 1, "
-        "node: {cscan: {dir: 1}}}}");
+        "{sort: {pattern: {b:-1}, limit: 1, node: {sortKeyGen: "
+        "{node: {cscan: {dir: 1}}}}}}");
     assertSolutionExists(
         "{limit: {n: 1, node: {fetch: {node: {mergeSort: {nodes: "
         "[{ixscan: {pattern: {a:1,b:-1,c:1}}}, "
         " {ixscan: {pattern: {a:1,b:-1,c:1}}}]}}}}}}");
+}
+
+TEST_F(QueryPlannerTest, InCantUseHashedIndexWithRegex) {
+    addIndex(BSON("a"
+                  << "hashed"));
+    runQuery(fromjson("{a: {$in: [/abc/]}}"));
+    ASSERT_EQUALS(getNumSolutions(), 1U);
 }
 
 //
@@ -1891,7 +2069,9 @@ TEST_F(QueryPlannerTest, MergeSort) {
     runQuerySortProj(fromjson("{$or: [{a:1}, {b:1}]}"), fromjson("{c:1}"), BSONObj());
 
     ASSERT_EQUALS(getNumSolutions(), 2U);
-    assertSolutionExists("{sort: {pattern: {c: 1}, limit: 0, node: {cscan: {dir: 1}}}}");
+    assertSolutionExists(
+        "{sort: {pattern: {c: 1}, limit: 0, node: {sortKeyGen: {node: "
+        "{cscan: {dir: 1}}}}}}");
     assertSolutionExists(
         "{fetch: {node: {mergeSort: {nodes: "
         "[{ixscan: {pattern: {a: 1, c: 1}}}, {ixscan: {pattern: {b: 1, c: 1}}}]}}}}");
@@ -1917,7 +2097,9 @@ TEST_F(QueryPlannerTest, MergeSortEvenIfSameIndex) {
     runQuerySortProj(fromjson("{$or: [{a:1}, {a:7}]}"), fromjson("{b:1}"), BSONObj());
 
     ASSERT_EQUALS(getNumSolutions(), 2U);
-    assertSolutionExists("{sort: {pattern: {b: 1}, limit: 0, node: {cscan: {dir: 1}}}}");
+    assertSolutionExists(
+        "{sort: {pattern: {b: 1}, limit: 0, node: {sortKeyGen: {node: "
+        "{cscan: {dir: 1}}}}}}");
     // TODO the second solution should be mergeSort rather than just sort
 }
 
@@ -1926,7 +2108,9 @@ TEST_F(QueryPlannerTest, ReverseScanForSort) {
     runQuerySortProj(BSONObj(), fromjson("{_id: -1}"), BSONObj());
 
     ASSERT_EQUALS(getNumSolutions(), 2U);
-    assertSolutionExists("{sort: {pattern: {_id: -1}, limit: 0, node: {cscan: {dir: 1}}}}");
+    assertSolutionExists(
+        "{sort: {pattern: {_id: -1}, limit: 0, node: {sortKeyGen: {node: "
+        "{cscan: {dir: 1}}}}}}");
     assertSolutionExists(
         "{fetch: {filter: null, node: {ixscan: "
         "{filter: null, pattern: {_id: 1}}}}}");
@@ -1943,8 +2127,8 @@ TEST_F(QueryPlannerTest, NaturalHint) {
 
     assertNumSolutions(1U);
     assertSolutionExists(
-        "{sort: {pattern: {b: 1}, limit: 0, node: "
-        "{cscan: {filter: {a: 1}, dir: 1}}}}");
+        "{sort: {pattern: {b: 1}, limit: 0, node: {sortKeyGen: {node: "
+        "{cscan: {filter: {a: 1}, dir: 1}}}}}}");
 }
 
 // Test $natural sort and its interaction with $natural hint.
@@ -2053,9 +2237,9 @@ TEST_F(QueryPlannerTest, HintValidWithSort) {
 
     assertNumSolutions(1U);
     assertSolutionExists(
-        "{sort: {pattern: {b: 1}, limit: 0, node: "
+        "{sort: {pattern: {b: 1}, limit: 0, node: {sortKeyGen: {node: "
         "{fetch: {filter: {b: 200}, "
-        "node: {ixscan: {filter: null, pattern: {a: 1}}}}}}}");
+        "node: {ixscan: {filter: null, pattern: {a: 1}}}}}}}}}");
 }
 
 TEST_F(QueryPlannerTest, HintElemMatch) {
@@ -2085,7 +2269,9 @@ TEST_F(QueryPlannerTest, SparseIndexIgnoreForSort) {
     runQuerySortProj(BSONObj(), fromjson("{a: 1}"), BSONObj());
 
     assertNumSolutions(1U);
-    assertSolutionExists("{sort: {pattern: {a: 1}, limit: 0, node: {cscan: {dir: 1}}}}");
+    assertSolutionExists(
+        "{sort: {pattern: {a: 1}, limit: 0, node: {sortKeyGen: {node: "
+        "{cscan: {dir: 1}}}}}}");
 }
 
 TEST_F(QueryPlannerTest, SparseIndexHintForSort) {
@@ -2104,7 +2290,9 @@ TEST_F(QueryPlannerTest, SparseIndexPreferCompoundIndexForSort) {
     runQuerySortProj(BSONObj(), fromjson("{a: 1}"), BSONObj());
 
     assertNumSolutions(2U);
-    assertSolutionExists("{sort: {pattern: {a: 1}, limit: 0, node: {cscan: {dir: 1}}}}");
+    assertSolutionExists(
+        "{sort: {pattern: {a: 1}, limit: 0, node: {sortKeyGen: {node: "
+        "{cscan: {dir: 1}}}}}}");
     assertSolutionExists(
         "{fetch: {filter: null, node: {ixscan: "
         "{filter: null, pattern: {a: 1, b: 1}}}}}");
@@ -2298,7 +2486,9 @@ TEST_F(QueryPlannerTest, NegationIndexForSort) {
     runQuerySortProj(fromjson("{a: {$ne: 1}}"), fromjson("{a: 1}"), BSONObj());
 
     assertNumSolutions(2U);
-    assertSolutionExists("{sort: {pattern: {a: 1}, limit: 0, node: {cscan: {dir: 1}}}}");
+    assertSolutionExists(
+        "{sort: {pattern: {a: 1}, limit: 0, node: {sortKeyGen: {node: "
+        "{cscan: {dir: 1}}}}}}");
     assertSolutionExists(
         "{fetch: {node: {ixscan: {pattern: {a: 1}, "
         "bounds: {a: [['MinKey',1,true,false], "
@@ -2678,8 +2868,8 @@ TEST_F(QueryPlannerTest, IndexBoundsIndexedSort) {
 
     assertNumSolutions(2U);
     assertSolutionExists(
-        "{sort: {pattern: {a:1}, limit: 0, node: "
-        "{cscan: {filter: {$or:[{a:1},{a:2}]}, dir: 1}}}}");
+        "{sort: {pattern: {a:1}, limit: 0, node: {sortKeyGen: {node: "
+        "{cscan: {filter: {$or:[{a:1},{a:2}]}, dir: 1}}}}}}");
     assertSolutionExists(
         "{fetch: {filter: null, node: {ixscan: {filter: null, "
         "pattern: {a:1}, bounds: {a: [[1,1,true,true], [2,2,true,true]]}}}}}");
@@ -2691,12 +2881,12 @@ TEST_F(QueryPlannerTest, IndexBoundsUnindexedSort) {
 
     assertNumSolutions(2U);
     assertSolutionExists(
-        "{sort: {pattern: {b:1}, limit: 0, node: "
-        "{cscan: {filter: {$or:[{a:1},{a:2}]}, dir: 1}}}}");
+        "{sort: {pattern: {b:1}, limit: 0, node: {sortKeyGen: {node: "
+        "{cscan: {filter: {$or:[{a:1},{a:2}]}, dir: 1}}}}}}");
     assertSolutionExists(
-        "{sort: {pattern: {b:1}, limit: 0, node: {fetch: "
+        "{sort: {pattern: {b:1}, limit: 0, node: {sortKeyGen: {node: {fetch: "
         "{filter: null, node: {ixscan: {filter: null, "
-        "pattern: {a:1}, bounds: {a: [[1,1,true,true], [2,2,true,true]]}}}}}}}");
+        "pattern: {a:1}, bounds: {a: [[1,1,true,true], [2,2,true,true]]}}}}}}}}}");
 }
 
 TEST_F(QueryPlannerTest, IndexBoundsUnindexedSortHint) {
@@ -2705,9 +2895,9 @@ TEST_F(QueryPlannerTest, IndexBoundsUnindexedSortHint) {
 
     assertNumSolutions(1U);
     assertSolutionExists(
-        "{sort: {pattern: {b:1}, limit: 0, node: {fetch: "
+        "{sort: {pattern: {b:1}, limit: 0, node: {sortKeyGen: {node: {fetch: "
         "{filter: null, node: {ixscan: {filter: null, "
-        "pattern: {a:1}, bounds: {a: [[1,1,true,true], [2,2,true,true]]}}}}}}}");
+        "pattern: {a:1}, bounds: {a: [[1,1,true,true], [2,2,true,true]]}}}}}}}}}");
 }
 
 TEST_F(QueryPlannerTest, CompoundIndexBoundsIntersectRanges) {
@@ -3167,7 +3357,9 @@ TEST_F(QueryPlannerTest, NoMutationsForCollscan) {
 TEST_F(QueryPlannerTest, NoMutationsForSort) {
     params.options = QueryPlannerParams::KEEP_MUTATIONS;
     runQuerySortProj(fromjson(""), fromjson("{a:1}"), BSONObj());
-    assertSolutionExists("{sort: {pattern: {a: 1}, limit: 0, node: {cscan: {dir: 1}}}}");
+    assertSolutionExists(
+        "{sort: {pattern: {a: 1}, limit: 0, node: {sortKeyGen: {node: "
+        "{cscan: {dir: 1}}}}}}");
 }
 
 // An index scan + fetch requires a keep node as it can flag data.  Also make sure we put it in
@@ -3177,8 +3369,8 @@ TEST_F(QueryPlannerTest, MutationsFromFetch) {
     addIndex(BSON("a" << 1));
     runQuerySortProj(fromjson("{a: 5}"), fromjson("{b:1}"), BSONObj());
     assertSolutionExists(
-        "{sort: {pattern: {b:1}, limit: 0, node: {keep: {node: "
-        "{fetch: {node: {ixscan: {pattern: {a:1}}}}}}}}}");
+        "{sort: {pattern: {b:1}, limit: 0, node: {keep: {node: {sortKeyGen: {node: "
+        "{fetch: {node: {ixscan: {pattern: {a:1}}}}}}}}}}}");
 }
 
 // Index scan w/covering doesn't require a keep node as there's no fetch.
@@ -3216,6 +3408,21 @@ TEST_F(QueryPlannerTest, NoKeepWithIndexedSort) {
     assertSolutionExists(
         "{fetch: {node: {mergeSort: {nodes: "
         "[{ixscan: {pattern: {a: 1, b: 1}}}, {ixscan: {pattern: {a: 1, b: 1}}}]}}}}");
+}
+
+// No KeepMutations when we have a sort that is not root, like the ntoreturn hack.
+TEST_F(QueryPlannerTest, NoKeepWithNToReturn) {
+    params.options = QueryPlannerParams::KEEP_MUTATIONS;
+    params.options |= QueryPlannerParams::SPLIT_LIMITED_SORT;
+    addIndex(BSON("a" << 1));
+    runQuerySortProjSkipLimit(fromjson("{a: 1}"), fromjson("{b: 1}"), BSONObj(), 0, 3);
+
+    assertSolutionExists(
+        "{or: {nodes: ["
+        "{sort: {pattern: {b: 1}, limit: 3, node: {sortKeyGen: {node: "
+        "{fetch: {node: {ixscan: {pattern: {a: 1}}}}}}}}}, "
+        "{sort: {pattern: {b: 1}, limit: 0, node: {sortKeyGen: {node: "
+        "{fetch: {node: {ixscan: {pattern: {a: 1}}}}}}}}}]}}");
 }
 
 // Make sure a top-level $or hits the limiting number
@@ -3337,10 +3544,10 @@ TEST_F(QueryPlannerTest, SplitLimitedSort) {
     // joined with an OR stage.
     assertSolutionExists(
         "{or: {nodes: ["
-        "{sort: {pattern: {b: 1}, limit: 3, node: "
-        "{fetch: {node: {ixscan: {pattern: {a: 1}}}}}}}, "
-        "{sort: {pattern: {b: 1}, limit: 0, node: "
-        "{fetch: {node: {ixscan: {pattern: {a: 1}}}}}}}]}}");
+        "{sort: {pattern: {b: 1}, limit: 3, node: {sortKeyGen: {node: "
+        "{fetch: {node: {ixscan: {pattern: {a: 1}}}}}}}}}, "
+        "{sort: {pattern: {b: 1}, limit: 0, node: {sortKeyGen: {node: "
+        "{fetch: {node: {ixscan: {pattern: {a: 1}}}}}}}}}]}}");
 }
 
 // The same query run as a find command with a limit should not require the "split limited sort"
@@ -3358,8 +3565,8 @@ TEST_F(QueryPlannerTest, NoSplitLimitedSortAsCommand) {
         "{limit: {n: 3, node: {fetch: {filter: {a:1}, node: "
         "{ixscan: {filter: null, pattern: {b: 1}}}}}}}");
     assertSolutionExists(
-        "{sort: {pattern: {b: 1}, limit: 3, node: {fetch: {filter: null,"
-        "node: {ixscan: {pattern: {a: 1}}}}}}}");
+        "{sort: {pattern: {b: 1}, limit: 3, node: {sortKeyGen: {node: {fetch: {filter: null,"
+        "node: {ixscan: {pattern: {a: 1}}}}}}}}}");
 }
 
 // Same query run as a find command with a batchSize rather than a limit should not require
@@ -3377,8 +3584,8 @@ TEST_F(QueryPlannerTest, NoSplitLimitedSortAsCommandBatchSize) {
         "{fetch: {filter: {a: 1}, node: {ixscan: "
         "{filter: null, pattern: {b: 1}}}}}");
     assertSolutionExists(
-        "{sort: {pattern: {b: 1}, limit: 0, node: {fetch: {filter: null,"
-        "node: {ixscan: {pattern: {a: 1}}}}}}}");
+        "{sort: {pattern: {b: 1}, limit: 0, node: {sortKeyGen: {node: {fetch: {filter: null,"
+        "node: {ixscan: {pattern: {a: 1}}}}}}}}}");
 }
 
 //
@@ -3745,6 +3952,22 @@ TEST_F(QueryPlannerTest, CoveredOrUniqueIndexLookup) {
         "{ixscan: {filter: null, pattern: {a: 1, b: 1}}}}}");
 }
 
+TEST_F(QueryPlannerTest, SortKeyMetaProjection) {
+    addIndex(BSON("a" << 1));
+
+    runQuerySortProj(BSONObj(), fromjson("{a: 1}"), fromjson("{b: {$meta: 'sortKey'}}"));
+
+    assertNumSolutions(2U);
+    assertSolutionExists(
+        "{proj: {spec: {b: {$meta: 'sortKey'}}, node: "
+        "{sort: {limit: 0, pattern: {a: 1}, node: {sortKeyGen: {node: "
+        "{cscan: {dir: 1}}}}}}}}");
+    assertSolutionExists(
+        "{proj: {spec: {b: {$meta: 'sortKey'}}, node: "
+        "{sortKeyGen: {node: {fetch: {filter: null, node: "
+        "{ixscan: {pattern: {a: 1}}}}}}}}}");
+}
+
 //
 // Test bad input to query planner helpers.
 //
@@ -3761,10 +3984,10 @@ TEST(BadInputTest, CacheDataFromTaggedTree) {
     // No relevant index matching the index tag.
     relevantIndices.push_back(IndexEntry(BSON("a" << 1)));
 
-    CanonicalQuery* cq;
-    Status cqStatus = CanonicalQuery::canonicalize("ns", BSON("a" << 3), &cq);
-    ASSERT_OK(cqStatus);
-    std::unique_ptr<CanonicalQuery> scopedCq(cq);
+    auto statusWithCQ =
+        CanonicalQuery::canonicalize(NamespaceString("test.collection"), BSON("a" << 3));
+    ASSERT_OK(statusWithCQ.getStatus());
+    std::unique_ptr<CanonicalQuery> scopedCq = std::move(statusWithCQ.getValue());
     scopedCq->root()->setTag(new IndexTag(1));
 
     s = QueryPlanner::cacheDataFromTaggedTree(scopedCq->root(), relevantIndices, &indexTree);
@@ -3773,10 +3996,11 @@ TEST(BadInputTest, CacheDataFromTaggedTree) {
 }
 
 TEST(BadInputTest, TagAccordingToCache) {
-    CanonicalQuery* cq;
-    Status cqStatus = CanonicalQuery::canonicalize("ns", BSON("a" << 3), &cq);
-    ASSERT_OK(cqStatus);
-    std::unique_ptr<CanonicalQuery> scopedCq(cq);
+    const NamespaceString nss("test.collection");
+
+    auto statusWithCQ = CanonicalQuery::canonicalize(nss, BSON("a" << 3));
+    ASSERT_OK(statusWithCQ.getStatus());
+    std::unique_ptr<CanonicalQuery> scopedCq = std::move(statusWithCQ.getValue());
 
     std::unique_ptr<PlanCacheIndexTree> indexTree(new PlanCacheIndexTree());
     indexTree->setIndexEntry(IndexEntry(BSON("a" << 1)));
@@ -3801,9 +4025,9 @@ TEST(BadInputTest, TagAccordingToCache) {
     ASSERT_OK(s);
 
     // Regenerate canonical query in order to clear tags.
-    cqStatus = CanonicalQuery::canonicalize("ns", BSON("a" << 3), &cq);
-    ASSERT_OK(cqStatus);
-    scopedCq.reset(cq);
+    statusWithCQ = CanonicalQuery::canonicalize(nss, BSON("a" << 3));
+    ASSERT_OK(statusWithCQ.getStatus());
+    scopedCq = std::move(statusWithCQ.getValue());
 
     // Mismatched tree topology.
     PlanCacheIndexTree* child = new PlanCacheIndexTree();
@@ -3811,6 +4035,32 @@ TEST(BadInputTest, TagAccordingToCache) {
     indexTree->children.push_back(child);
     s = QueryPlanner::tagAccordingToCache(scopedCq->root(), indexTree.get(), indexMap);
     ASSERT_NOT_OK(s);
+}
+
+// A query run as a find command with a sort and ntoreturn should generate a plan implementing
+// the 'ntoreturn hack'.
+TEST_F(QueryPlannerTest, NToReturnHackWithFindCommand) {
+    params.options |= QueryPlannerParams::SPLIT_LIMITED_SORT;
+
+    runQueryAsCommand(fromjson("{find: 'testns', sort: {a:1}, ntoreturn:3}"));
+
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{or: {nodes: ["
+        "{sort: {limit:3, pattern: {a:1}, node: {sortKeyGen: {node: {cscan: {dir:1}}}}}}, "
+        "{sort: {limit:0, pattern: {a:1}, node: {sortKeyGen: {node: {cscan: {dir:1}}}}}}"
+        "]}}");
+}
+
+TEST_F(QueryPlannerTest, NToReturnHackWithSingleBatch) {
+    params.options |= QueryPlannerParams::SPLIT_LIMITED_SORT;
+
+    runQueryAsCommand(fromjson("{find: 'testns', sort: {a:1}, ntoreturn:3, singleBatch:true}"));
+
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{sort: {pattern: {a:1}, limit:3, node: {sortKeyGen: {node: "
+        "{cscan: {dir:1, filter: {}}}}}}}");
 }
 
 }  // namespace

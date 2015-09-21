@@ -30,28 +30,34 @@
 
 #include "mongo/platform/basic.h"
 
-#include <chrono>
-
 #include "mongo/s/catalog/replset/replset_dist_lock_manager.h"
 
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/db/service_context.h"
 #include "mongo/s/catalog/dist_lock_catalog.h"
-#include "mongo/s/type_lockpings.h"
-#include "mongo/s/type_locks.h"
+#include "mongo/s/catalog/type_lockpings.h"
+#include "mongo/s/catalog/type_locks.h"
+#include "mongo/stdx/chrono.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/concurrency/thread_name.h"
+#include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
 
+MONGO_FP_DECLARE(setDistLockTimeout);
+
 using std::string;
 using std::unique_ptr;
 using stdx::chrono::milliseconds;
-using std::chrono::duration_cast;
+using stdx::chrono::duration_cast;
+
+const stdx::chrono::seconds ReplSetDistLockManager::kDistLockWriteConcernTimeout{5};
+const stdx::chrono::seconds ReplSetDistLockManager::kDistLockPingInterval{30};
+const stdx::chrono::minutes ReplSetDistLockManager::kDistLockExpirationTime{15};
 
 ReplSetDistLockManager::ReplSetDistLockManager(ServiceContext* globalContext,
                                                StringData processID,
@@ -67,10 +73,13 @@ ReplSetDistLockManager::ReplSetDistLockManager(ServiceContext* globalContext,
 ReplSetDistLockManager::~ReplSetDistLockManager() = default;
 
 void ReplSetDistLockManager::startUp() {
-    _execThread = stdx::make_unique<stdx::thread>(&ReplSetDistLockManager::doTask, this);
+    if (!_execThread) {
+        _execThread = stdx::make_unique<stdx::thread>(&ReplSetDistLockManager::doTask, this);
+    }
 }
 
-void ReplSetDistLockManager::shutDown() {
+void ReplSetDistLockManager::shutDown(bool allowNetworking) {
+    invariant(allowNetworking);
     {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
         _isShutDown = true;
@@ -98,7 +107,7 @@ bool ReplSetDistLockManager::isShutDown() {
 
 void ReplSetDistLockManager::doTask() {
     LOG(0) << "creating distributed lock ping thread for process " << _processID
-           << " (sleeping for " << duration_cast<milliseconds>(_pingInterval).count() << " ms)";
+           << " (sleeping for " << _pingInterval << ")";
 
     Timer elapsedSincelastPing(_serviceContext->getTickSource());
     while (!isShutDown()) {
@@ -143,19 +152,25 @@ void ReplSetDistLockManager::doTask() {
     }
 }
 
-StatusWith<bool> ReplSetDistLockManager::canOvertakeLock(LocksType lockDoc) {
+StatusWith<bool> ReplSetDistLockManager::canOvertakeLock(LocksType lockDoc,
+                                                         const milliseconds& lockExpiration) {
     const auto& processID = lockDoc.getProcess();
     auto pingStatus = _catalog->getPing(processID);
-    if (!pingStatus.isOK()) {
-        return pingStatus.getStatus();
-    }
 
-    const auto& pingDoc = pingStatus.getValue();
-    string errMsg;
-    if (!pingDoc.isValid(&errMsg)) {
-        return {ErrorCodes::UnsupportedFormat,
-                str::stream() << "invalid ping document for " << processID << ": " << errMsg};
-    }
+    Date_t pingValue;
+    if (pingStatus.isOK()) {
+        const auto& pingDoc = pingStatus.getValue();
+        Status pingDocValidationStatus = pingDoc.validate();
+        if (!pingDocValidationStatus.isOK()) {
+            return {ErrorCodes::UnsupportedFormat,
+                    str::stream() << "invalid ping document for " << processID << ": "
+                                  << pingDocValidationStatus.toString()};
+        }
+
+        pingValue = pingDoc.getPing();
+    } else if (pingStatus.getStatus() != ErrorCodes::NoMatchingDocument) {
+        return pingStatus.getStatus();
+    }  // else use default pingValue if ping document does not exist.
 
     Timer timer(_serviceContext->getTickSource());
     auto serverInfoStatus = _catalog->getServerInfo();
@@ -168,7 +183,6 @@ StatusWith<bool> ReplSetDistLockManager::canOvertakeLock(LocksType lockDoc) {
     // time from the config server.
     milliseconds delay(timer.millis() / 2);  // Assuming symmetrical delay.
 
-    Date_t pingValue = pingDoc.getPing();
     const auto& serverInfo = serverInfoStatus.getValue();
 
     stdx::lock_guard<stdx::mutex> lk(_mutex);
@@ -218,17 +232,15 @@ StatusWith<bool> ReplSetDistLockManager::canOvertakeLock(LocksType lockDoc) {
     }
 
     milliseconds elapsedSinceLastPing(configServerLocalTime - pingInfo->configLocalTime);
-    if (elapsedSinceLastPing >= _lockExpiration) {
+    if (elapsedSinceLastPing >= lockExpiration) {
         LOG(0) << "forcing lock '" << lockDoc.getName() << "' because elapsed time "
-               << duration_cast<milliseconds>(elapsedSinceLastPing).count()
-               << " ms >= takeover time " << duration_cast<milliseconds>(_lockExpiration).count()
-               << " ms";
+               << elapsedSinceLastPing << " >= takeover time " << lockExpiration;
         return true;
     }
 
     LOG(1) << "could not force lock '" << lockDoc.getName() << "' because elapsed time "
-           << duration_cast<milliseconds>(elapsedSinceLastPing).count() << " ms < takeover time "
-           << duration_cast<milliseconds>(_lockExpiration).count() << " ms";
+           << durationCount<Milliseconds>(elapsedSinceLastPing) << " < takeover time "
+           << durationCount<Milliseconds>(lockExpiration) << " ms";
     return false;
 }
 
@@ -241,9 +253,14 @@ StatusWith<DistLockManager::ScopedDistLock> ReplSetDistLockManager::lock(
         OID lockSessionID = OID::gen();
         string who = str::stream() << _processID << ":" << getThreadName();
 
+        auto lockExpiration = _lockExpiration;
+        MONGO_FAIL_POINT_BLOCK(setDistLockTimeout, customTimeout) {
+            const BSONObj& data = customTimeout.getData();
+            lockExpiration = stdx::chrono::milliseconds(data["timeoutMs"].numberInt());
+        }
         LOG(1) << "trying to acquire new distributed lock for " << name
-               << " ( lock timeout : " << duration_cast<milliseconds>(_lockExpiration).count()
-               << " ms, ping interval : " << duration_cast<milliseconds>(_pingInterval).count()
+               << " ( lock timeout : " << durationCount<Milliseconds>(lockExpiration)
+               << " ms, ping interval : " << durationCount<Milliseconds>(_pingInterval)
                << " ms, process : " << _processID << " )"
                << " with lockSessionID: " << lockSessionID << ", why: " << whyMessage;
 
@@ -278,7 +295,7 @@ StatusWith<DistLockManager::ScopedDistLock> ReplSetDistLockManager::lock(
         // found, use the normal grab lock path to acquire it.
         if (getLockStatusResult.isOK()) {
             auto currentLock = getLockStatusResult.getValue();
-            auto canOvertakeResult = canOvertakeLock(currentLock);
+            auto canOvertakeResult = canOvertakeLock(currentLock, lockExpiration);
 
             if (!canOvertakeResult.isOK()) {
                 return canOvertakeResult.getStatus();
@@ -347,18 +364,7 @@ void ReplSetDistLockManager::unlock(const DistLockHandle& lockSessionID) {
 }
 
 Status ReplSetDistLockManager::checkStatus(const DistLockHandle& lockHandle) {
-    auto lockStatus = _catalog->getLockByTS(lockHandle);
-
-    if (!lockStatus.isOK()) {
-        return lockStatus.getStatus();
-    }
-
-    auto lockDoc = lockStatus.getValue();
-    if (!lockDoc.isValid(nullptr)) {
-        return {ErrorCodes::LockNotFound, "lock owner changed"};
-    }
-
-    return Status::OK();
+    return _catalog->getLockByTS(lockHandle).getStatus();
 }
 
 void ReplSetDistLockManager::queueUnlock(const DistLockHandle& lockSessionID) {

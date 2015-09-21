@@ -44,7 +44,15 @@ public:
     /**
      * Actions taken based on heartbeat responses
      */
-    enum Action { NoAction, Reconfig, StartElection, StepDownSelf, StepDownRemotePrimary };
+    enum Action {
+        NoAction,
+        Reconfig,
+        ScheduleElection,
+        StartElection,
+        StepDownSelf,
+        StepDownRemotePrimary,
+        PriorityTakeover
+    };
 
     /**
      * Makes a new action representing doing nothing.
@@ -57,9 +65,22 @@ public:
     static HeartbeatResponseAction makeReconfigAction();
 
     /**
+     * Makes a new action telling the current node to schedule an election due to election timeout
+     * expiry. If an election timeout is already scheduled, the current node should not reschedule
+     * the timeout. Valid under protocol version 1 only.
+     */
+    static HeartbeatResponseAction makeScheduleElectionAction();
+
+    /**
      * Makes a new action telling the current node to attempt to elect itself primary.
      */
     static HeartbeatResponseAction makeElectAction();
+
+    /**
+     * Makes a new action telling the current node to schedule an event to attempt to elect itself
+     * primary after the appropriate priority takeover delay.
+     */
+    static HeartbeatResponseAction makePriorityTakeoverAction();
 
     /**
      * Makes a new action telling the current node to step down as primary.

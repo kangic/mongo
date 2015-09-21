@@ -34,7 +34,6 @@
 #include "mongo/db/repl/sync_tail.h"
 
 #include <boost/functional/hash.hpp>
-#include <boost/ref.hpp>
 #include <memory>
 #include "third_party/murmurhash3/MurmurHash3.h"
 
@@ -55,9 +54,11 @@
 #include "mongo/db/repl/bgsync.h"
 #include "mongo/db/repl/minvalid.h"
 #include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/oplogreader.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replica_set_config.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/server_parameters.h"
 #include "mongo/db/stats/timer_stats.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/fail_point_service.h"
@@ -70,14 +71,34 @@ using std::endl;
 
 namespace repl {
 #if defined(MONGO_PLATFORM_64)
-const int replWriterThreadCount = 16;
+int SyncTail::replWriterThreadCount = 16;
 const int replPrefetcherThreadCount = 16;
 #elif defined(MONGO_PLATFORM_32)
-const int replWriterThreadCount = 2;
+int SyncTail::replWriterThreadCount = 2;
 const int replPrefetcherThreadCount = 2;
 #else
 #error need to include something that defines MONGO_PLATFORM_XX
 #endif
+
+class ExportedWriterThreadCountParameter : public ExportedServerParameter<int> {
+public:
+    ExportedWriterThreadCountParameter()
+        : ExportedServerParameter<int>(ServerParameterSet::getGlobal(),
+                                       "replWriterThreadCount",
+                                       &SyncTail::replWriterThreadCount,
+                                       true,   // allowedToChangeAtStartup
+                                       false)  // allowedToChangeAtRuntime
+    {}
+
+    virtual Status validate(const int& potentialNewValue) {
+        if (potentialNewValue < 1 || potentialNewValue > 256) {
+            return Status(ErrorCodes::BadValue, "replWriterThreadCount must be between 1 and 256");
+        }
+        return Status::OK();
+    }
+
+} exportedWriterThreadCountParam;
+
 
 static Counter64 opsAppliedStats;
 
@@ -173,6 +194,9 @@ Status SyncTail::syncApply(OperationContext* txn,
         DisableDocumentValidation validationDisabler(txn);
 
         Status status = applyOperationInLock(txn, db, op, convertUpdateToUpsert);
+        if (!status.isOK() && status.code() == ErrorCodes::WriteConflict) {
+            throw WriteConflictException();
+        }
         incrementOpsAppliedStats();
         return status;
     };
@@ -285,7 +309,7 @@ void applyOps(const std::vector<std::vector<BSONObj>>& writerVectors,
          it != writerVectors.end();
          ++it) {
         if (!it->empty()) {
-            writerPool->schedule(func, boost::cref(*it), sync);
+            writerPool->schedule(func, stdx::cref(*it), sync);
         }
     }
     writerPool->join();
@@ -407,7 +431,8 @@ void SyncTail::_applyOplogUntil(OperationContext* txn, const OpTime& endOpTime) 
 
             // Check if we reached the end
             const BSONObj currentOp = ops.back();
-            const OpTime currentOpTime = extractOpTime(currentOp);
+            const OpTime currentOpTime =
+                fassertStatusOK(28772, OpTime::parseFromOplogEntry(currentOp));
 
             // When we reach the end return this batch
             if (currentOpTime == endOpTime) {
@@ -527,7 +552,7 @@ void SyncTail::oplogApplication() {
                 tryToGoLiveAsASecondary(&txn, replCoord);
             }
 
-            const int slaveDelaySecs = replCoord->getSlaveDelaySecs().count();
+            const int slaveDelaySecs = durationCount<Seconds>(replCoord->getSlaveDelaySecs());
             if (!ops.empty() && slaveDelaySecs > 0) {
                 const BSONObj lastOp = ops.back();
                 const unsigned int opTimestampSecs = lastOp["ts"].timestamp().getSecs();
@@ -540,6 +565,11 @@ void SyncTail::oplogApplication() {
                     break;
                 }
             }
+
+            if (MONGO_FAIL_POINT(rsSyncApplyStop)) {
+                break;
+            }
+
             // keep fetching more ops as long as we haven't filled up a full batch yet
         } while (!tryPopAndWaitForMore(&txn, &ops, replCoord) &&  // tryPopAndWaitForMore returns
                                                                   // true when we need to end a
@@ -550,6 +580,8 @@ void SyncTail::oplogApplication() {
         // For pausing replication in tests
         while (MONGO_FAIL_POINT(rsSyncApplyStop)) {
             sleepmillis(0);
+            if (inShutdown())
+                return;
         }
 
         if (ops.empty()) {
@@ -562,7 +594,7 @@ void SyncTail::oplogApplication() {
         // Set minValid to the last op to be applied in this next batch.
         // This will cause this node to go into RECOVERING state
         // if we should crash and restart before updating the oplog
-        setMinValid(&txn, extractOpTime(lastOp));
+        setMinValid(&txn, fassertStatusOK(28773, OpTime::parseFromOplogEntry(lastOp)));
         multiApply(&txn,
                    ops,
                    &_prefetcherPool,
@@ -651,7 +683,7 @@ bool SyncTail::tryPopAndWaitForMore(OperationContext* txn,
 
 void SyncTail::handleSlaveDelay(const BSONObj& lastOp) {
     ReplicationCoordinator* replCoord = getGlobalReplicationCoordinator();
-    int slaveDelaySecs = replCoord->getSlaveDelaySecs().count();
+    int slaveDelaySecs = durationCount<Seconds>(replCoord->getSlaveDelaySecs());
 
     // ignore slaveDelay if the box is still initializing. once
     // it becomes secondary we can worry about it.
@@ -675,7 +707,7 @@ void SyncTail::handleSlaveDelay(const BSONObj& lastOp) {
                     sleepsecs(6);
 
                     // Handle reconfigs that changed the slave delay
-                    if (replCoord->getSlaveDelaySecs().count() != slaveDelaySecs)
+                    if (durationCount<Seconds>(replCoord->getSlaveDelaySecs()) != slaveDelaySecs)
                         break;
                 }
             }
@@ -717,8 +749,17 @@ BSONObj SyncTail::getMissingDoc(OperationContext* txn, Database* db, const BSONO
             continue;  // try again
         }
 
-        // might be more than just _id in the update criteria
-        BSONObj query = BSONObjBuilder().append(o.getObjectField("o2")["_id"]).obj();
+        // get _id from oplog entry to create query to fetch document.
+        const BSONElement opElem = o.getField("op");
+        const bool isUpdate = !opElem.eoo() && opElem.str() == "u";
+        const BSONElement idElem = o.getObjectField(isUpdate ? "o2" : "o")["_id"];
+
+        if (idElem.eoo()) {
+            severe() << "cannot fetch missing document without _id field: " << o.toString();
+            fassertFailedNoTrace(28742);
+        }
+
+        BSONObj query = BSONObjBuilder().append(idElem).obj();
         BSONObj missingObj;
         try {
             missingObj = missingObjReader.findOne(ns, query);
@@ -765,11 +806,10 @@ bool SyncTail::shouldRetry(OperationContext* txn, const BSONObj& o) {
             Collection* const coll = db->getOrCreateCollection(txn, nss.toString());
             invariant(coll);
 
-            StatusWith<RecordId> result = coll->insertDocument(txn, missingObj, true);
-            uassert(
-                15917,
-                str::stream() << "failed to insert missing doc: " << result.getStatus().toString(),
-                result.isOK());
+            Status status = coll->insertDocument(txn, missingObj, true);
+            uassert(15917,
+                    str::stream() << "failed to insert missing doc: " << status.toString(),
+                    status.isOK());
 
             LOG(1) << "inserted missing doc: " << missingObj.toString() << endl;
 
@@ -808,12 +848,14 @@ void multiSyncApply(const std::vector<BSONObj>& ops, SyncTail* st) {
 
     for (std::vector<BSONObj>::const_iterator it = ops.begin(); it != ops.end(); ++it) {
         try {
-            if (!SyncTail::syncApply(&txn, *it, convertUpdatesToUpserts).isOK()) {
+            const Status s = SyncTail::syncApply(&txn, *it, convertUpdatesToUpserts);
+            if (!s.isOK()) {
+                severe() << "Error applying operation (" << it->toString() << "): " << s;
                 fassertFailedNoTrace(16359);
             }
         } catch (const DBException& e) {
-            error() << "writer worker caught exception: " << causedBy(e)
-                    << " on: " << it->toString();
+            severe() << "writer worker caught exception: " << causedBy(e)
+                     << " on: " << it->toString();
 
             if (inShutdown()) {
                 return;
@@ -839,9 +881,12 @@ void multiInitialSyncApply(const std::vector<BSONObj>& ops, SyncTail* st) {
 
     for (std::vector<BSONObj>::const_iterator it = ops.begin(); it != ops.end(); ++it) {
         try {
-            if (!SyncTail::syncApply(&txn, *it, convertUpdatesToUpserts).isOK()) {
+            const Status s = SyncTail::syncApply(&txn, *it, convertUpdatesToUpserts);
+            if (!s.isOK()) {
                 if (st->shouldRetry(&txn, *it)) {
-                    if (!SyncTail::syncApply(&txn, *it, convertUpdatesToUpserts).isOK()) {
+                    const Status s2 = SyncTail::syncApply(&txn, *it, convertUpdatesToUpserts);
+                    if (!s2.isOK()) {
+                        severe() << "Error applying operation (" << it->toString() << "): " << s2;
                         fassertFailedNoTrace(15915);
                     }
                 }
@@ -851,8 +896,8 @@ void multiInitialSyncApply(const std::vector<BSONObj>& ops, SyncTail* st) {
                 // subsequently got deleted and no longer exists on the Sync Target at all
             }
         } catch (const DBException& e) {
-            error() << "writer worker caught exception: " << causedBy(e)
-                    << " on: " << it->toString();
+            severe() << "writer worker caught exception: " << causedBy(e)
+                     << " on: " << it->toString();
 
             if (inShutdown()) {
                 return;

@@ -29,7 +29,6 @@
 
 #include "mongo/logger/log_component.h"
 
-#include <boost/static_assert.hpp>
 
 #include "mongo/base/init.h"
 #include "mongo/util/assert_util.h"
@@ -70,11 +69,11 @@ MONGO_INITIALIZER_WITH_PREREQUISITES(SetupDottedNames,
 // Children always come after parent component.
 // This makes it unnecessary to compute children of each component
 // when setting/clearing log severities in LogComponentSettings.
-#define DECLARE_LOG_COMPONENT_PARENT(CHILD, PARENT)        \
-    case (CHILD):                                          \
-        do {                                               \
-            BOOST_STATIC_ASSERT(int(CHILD) > int(PARENT)); \
-            return (PARENT);                               \
+#define DECLARE_LOG_COMPONENT_PARENT(CHILD, PARENT)                              \
+    case (CHILD):                                                                \
+        do {                                                                     \
+            static_assert(int(CHILD) > int(PARENT), "int(CHILD) > int(PARENT)"); \
+            return (PARENT);                                                     \
         } while (0)
 
 LogComponent LogComponent::parent() const {
@@ -120,6 +119,8 @@ StringData LogComponent::toStringData() const {
             return createStringData("journal");
         case kWrite:
             return createStringData("write");
+        case kFTDC:
+            return createStringData("ftdc");
         case kNumLogComponents:
             return createStringData("total");
             // No default. Compiler should complain if there's a log component that's not handled.
@@ -184,6 +185,8 @@ StringData LogComponent::getNameForLog() const {
             return createStringData("JOURNAL ");
         case kWrite:
             return createStringData("WRITE   ");
+        case kFTDC:
+            return createStringData("FTDC    ");
         case kNumLogComponents:
             return createStringData("TOTAL   ");
             // No default. Compiler should complain if there's a log component that's not handled.

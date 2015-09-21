@@ -33,9 +33,10 @@
 #include "mongo/base/status.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/write_concern_options.h"
-#include "mongo/db/repl/read_after_optime_args.h"
-#include "mongo/db/repl/read_after_optime_response.h"
+#include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/repl/read_concern_response.h"
 #include "mongo/db/repl/replica_set_config.h"
+#include "mongo/db/storage/snapshot_name.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
@@ -145,6 +146,12 @@ void ReplicationCoordinatorMock::setMyLastOptime(const OpTime& opTime) {
     _myLastOpTime = opTime;
 }
 
+void ReplicationCoordinatorMock::setMyLastOptimeForward(const OpTime& opTime) {
+    if (opTime > _myLastOpTime) {
+        _myLastOpTime = opTime;
+    }
+}
+
 void ReplicationCoordinatorMock::resetMyLastOptime() {
     _myLastOpTime = OpTime();
 }
@@ -153,9 +160,9 @@ OpTime ReplicationCoordinatorMock::getMyLastOptime() const {
     return _myLastOpTime;
 }
 
-ReadAfterOpTimeResponse ReplicationCoordinatorMock::waitUntilOpTime(
-    OperationContext* txn, const ReadAfterOpTimeArgs& settings) {
-    return ReadAfterOpTimeResponse();
+ReadConcernResponse ReplicationCoordinatorMock::waitUntilOpTime(OperationContext* txn,
+                                                                const ReadConcernArgs& settings) {
+    return ReadConcernResponse();
 }
 
 
@@ -197,6 +204,10 @@ ReplicaSetConfig ReplicationCoordinatorMock::getConfig() const {
 void ReplicationCoordinatorMock::processReplSetGetConfig(BSONObjBuilder* result) {
     // TODO
 }
+
+void ReplicationCoordinatorMock::processReplSetMetadata(const rpc::ReplSetMetadata& replMetadata) {}
+
+void ReplicationCoordinatorMock::cancelAndRescheduleElectionTimeout() {}
 
 Status ReplicationCoordinatorMock::processReplSetGetStatus(BSONObjBuilder* result) {
     return Status::OK();
@@ -297,7 +308,7 @@ Status ReplicationCoordinatorMock::checkReplEnabledForCommand(BSONObjBuilder* re
     return Status::OK();
 }
 
-HostAndPort ReplicationCoordinatorMock::chooseNewSyncSource() {
+HostAndPort ReplicationCoordinatorMock::chooseNewSyncSource(const Timestamp& lastTimestampFetched) {
     return HostAndPort();
 }
 
@@ -327,7 +338,10 @@ Status ReplicationCoordinatorMock::processReplSetDeclareElectionWinner(
     return Status::OK();
 }
 
-void ReplicationCoordinatorMock::prepareCursorResponseInfo(BSONObjBuilder* objBuilder) {}
+void ReplicationCoordinatorMock::prepareReplResponseMetadata(const rpc::RequestInterface& request,
+                                                             const OpTime& lastOpTimeFromClient,
+                                                             const ReadConcernArgs& readConcern,
+                                                             BSONObjBuilder* builder) {}
 
 Status ReplicationCoordinatorMock::processHeartbeatV1(const ReplSetHeartbeatArgsV1& args,
                                                       ReplSetHeartbeatResponse* response) {
@@ -341,12 +355,28 @@ bool ReplicationCoordinatorMock::isV1ElectionProtocol() {
 void ReplicationCoordinatorMock::summarizeAsHtml(ReplSetHtmlSummary* output) {}
 
 long long ReplicationCoordinatorMock::getTerm() {
-    return OpTime::kDefaultTerm;
+    return OpTime::kInitialTerm;
 }
 
-bool ReplicationCoordinatorMock::updateTerm(long long term) {
-    return false;
+Status ReplicationCoordinatorMock::updateTerm(long long term) {
+    return Status::OK();
 }
+
+SnapshotName ReplicationCoordinatorMock::reserveSnapshotName(OperationContext* txn) {
+    return SnapshotName(_snapshotNameGenerator.addAndFetch(1));
+}
+
+void ReplicationCoordinatorMock::forceSnapshotCreation() {}
+
+void ReplicationCoordinatorMock::onSnapshotCreate(OpTime timeOfSnapshot, SnapshotName name) {}
+
+void ReplicationCoordinatorMock::dropAllSnapshots() {}
+
+OpTime ReplicationCoordinatorMock::getCurrentCommittedSnapshotOpTime() {
+    return OpTime();
+}
+
+void ReplicationCoordinatorMock::waitForNewSnapshot(OperationContext* txn) {}
 
 }  // namespace repl
 }  // namespace mongo

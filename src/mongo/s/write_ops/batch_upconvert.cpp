@@ -30,7 +30,6 @@
 
 #include "mongo/s/write_ops/batch_upconvert.h"
 
-
 #include "mongo/bson/bsonobj.h"
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/db/dbmessage.h"
@@ -43,25 +42,14 @@
 
 namespace mongo {
 
-using mongoutils::str::stream;
+using str::stream;
 using std::string;
 using std::unique_ptr;
 using std::vector;
 
-void msgToBatchRequests(const Message& msg, vector<BatchedCommandRequest*>* requests) {
-    int opType = msg.operation();
+namespace {
 
-    unique_ptr<BatchedCommandRequest> request;
-    if (opType == dbInsert) {
-        msgToBatchInserts(msg, requests);
-    } else if (opType == dbUpdate) {
-        requests->push_back(msgToBatchUpdate(msg));
-    } else {
-        dassert(opType == dbDelete);
-        requests->push_back(msgToBatchDelete(msg));
-    }
-}
-
+// Batch inserts may get mapped to multiple batch requests, to avoid spilling MaxBSONObjSize
 void msgToBatchInserts(const Message& insertMsg, vector<BatchedCommandRequest*>* insertRequests) {
     // Parsing DbMessage throws
     DbMessage dbMsg(insertMsg);
@@ -93,7 +81,7 @@ void msgToBatchInserts(const Message& insertMsg, vector<BatchedCommandRequest*>*
         // No exceptions from here on
         BatchedCommandRequest* request =
             new BatchedCommandRequest(BatchedCommandRequest::BatchType_Insert);
-        request->setNSS(nss);
+        request->setNS(nss);
         for (vector<BSONObj>::const_iterator it = docs.begin(); it != docs.end(); ++it) {
             request->getInsertRequest()->addToDocuments(*it);
         }
@@ -123,7 +111,7 @@ BatchedCommandRequest* msgToBatchUpdate(const Message& updateMsg) {
 
     BatchedCommandRequest* request =
         new BatchedCommandRequest(BatchedCommandRequest::BatchType_Update);
-    request->setNSS(nss);
+    request->setNS(nss);
     request->getUpdateRequest()->addToUpdates(updateDoc);
     request->setWriteConcern(WriteConcernOptions::Acknowledged);
 
@@ -145,7 +133,7 @@ BatchedCommandRequest* msgToBatchDelete(const Message& deleteMsg) {
 
     BatchedCommandRequest* request =
         new BatchedCommandRequest(BatchedCommandRequest::BatchType_Delete);
-    request->setNSS(nss);
+    request->setNS(nss);
     request->getDeleteRequest()->addToDeletes(deleteDoc);
     request->setWriteConcern(WriteConcernOptions::Acknowledged);
 
@@ -155,6 +143,21 @@ BatchedCommandRequest* msgToBatchDelete(const Message& deleteMsg) {
 void buildErrorFromResponse(const BatchedCommandResponse& response, WriteErrorDetail* error) {
     error->setErrCode(response.getErrCode());
     error->setErrMessage(response.getErrMessage());
+}
+
+}  // namespace
+
+void msgToBatchRequests(const Message& msg, vector<BatchedCommandRequest*>* requests) {
+    int opType = msg.operation();
+
+    if (opType == dbInsert) {
+        msgToBatchInserts(msg, requests);
+    } else if (opType == dbUpdate) {
+        requests->push_back(msgToBatchUpdate(msg));
+    } else {
+        dassert(opType == dbDelete);
+        requests->push_back(msgToBatchDelete(msg));
+    }
 }
 
 bool batchErrorToLastError(const BatchedCommandRequest& request,
@@ -223,4 +226,5 @@ bool batchErrorToLastError(const BatchedCommandRequest& request,
 
     return false;
 }
-}
+
+}  // namespace mongo

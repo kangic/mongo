@@ -28,6 +28,9 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
+#include <vector>
+
 #include "mongo/bson/oid.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
@@ -37,14 +40,14 @@
 
 namespace mongo {
 
-class RemoteCommandRunner;
+struct HostAndPort;
+class NamespaceString;
 class RemoteCommandTargeter;
+class ShardRegistry;
 
 class DistLockCatalogImpl final : public DistLockCatalog {
 public:
-    DistLockCatalogImpl(RemoteCommandTargeter* targeter,
-                        RemoteCommandRunner* executor,
-                        Milliseconds writeConcernTimeout);
+    DistLockCatalogImpl(ShardRegistry* shardRegistry, Milliseconds writeConcernTimeout);
 
     virtual ~DistLockCatalogImpl();
 
@@ -78,8 +81,15 @@ public:
     virtual Status stopPing(StringData processId) override;
 
 private:
-    RemoteCommandRunner* _cmdRunner;
-    RemoteCommandTargeter* _targeter;
+    RemoteCommandTargeter* _targeter();
+
+    StatusWith<std::vector<BSONObj>> _findOnConfig(const HostAndPort& host,
+                                                   const NamespaceString& nss,
+                                                   const BSONObj& query,
+                                                   const BSONObj& sort,
+                                                   boost::optional<long long> limit);
+
+    ShardRegistry* _client;
 
     // These are not static to avoid initialization order fiasco.
     const WriteConcernOptions _writeConcern;

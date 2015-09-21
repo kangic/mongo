@@ -55,6 +55,7 @@ namespace QueryStageAnd {
 using std::set;
 using std::shared_ptr;
 using std::unique_ptr;
+using stdx::make_unique;
 
 class QueryStageAndBase {
 public:
@@ -180,7 +181,7 @@ public:
         addIndex(BSON("bar" << 1));
 
         WorkingSet ws;
-        unique_ptr<AndHashStage> ah(new AndHashStage(&ws, coll));
+        auto ah = make_unique<AndHashStage>(&_txn, &ws, coll);
 
         // Foo <= 20
         IndexScanParams params;
@@ -223,7 +224,7 @@ public:
             }
         }
         size_t memUsageAfter = ah->getMemUsage();
-        ah->restoreState(&_txn);
+        ah->restoreState();
 
         // Invalidating a read object should decrease memory usage.
         ASSERT_LESS_THAN(memUsageAfter, memUsageBefore);
@@ -235,7 +236,7 @@ public:
         // Expect to find the right value of foo in the flagged item.
         WorkingSetMember* member = ws.get(*flagged.begin());
         ASSERT_TRUE(NULL != member);
-        ASSERT_EQUALS(WorkingSetMember::OWNED_OBJ, member->state);
+        ASSERT_EQUALS(WorkingSetMember::OWNED_OBJ, member->getState());
         BSONElement elt;
         ASSERT_TRUE(member->getFieldDotted("foo", &elt));
         ASSERT_EQUALS(15, elt.numberInt());
@@ -286,7 +287,7 @@ public:
         addIndex(BSON("baz" << 1));
 
         WorkingSet ws;
-        unique_ptr<AndHashStage> ah(new AndHashStage(&ws, coll));
+        auto ah = make_unique<AndHashStage>(&_txn, &ws, coll);
 
         // Foo <= 20 (descending)
         IndexScanParams params;
@@ -331,7 +332,7 @@ public:
         // Look ahead results do not count towards memory usage.
         ASSERT_EQUALS(memUsageBefore, memUsageAfter);
 
-        ah->restoreState(&_txn);
+        ah->restoreState();
 
         // The deleted obj should show up in flagged.
         ASSERT_EQUALS(size_t(1), flagged.size());
@@ -374,7 +375,7 @@ public:
         addIndex(BSON("bar" << 1));
 
         WorkingSet ws;
-        unique_ptr<AndHashStage> ah(new AndHashStage(&ws, coll));
+        auto ah = make_unique<AndHashStage>(&_txn, &ws, coll);
 
         // Foo <= 20
         IndexScanParams params;
@@ -429,7 +430,7 @@ public:
         // before hashed AND is done reading the first child (stage has to
         // hold 21 keys in buffer for Foo <= 20).
         WorkingSet ws;
-        unique_ptr<AndHashStage> ah(new AndHashStage(&ws, coll, 20 * big.size()));
+        auto ah = make_unique<AndHashStage>(&_txn, &ws, coll, 20 * big.size());
 
         // Foo <= 20
         IndexScanParams params;
@@ -482,7 +483,7 @@ public:
         // keys in last child's index are not buffered. There are 6 keys
         // that satisfy the criteria Foo <= 20 and Bar >= 10 and 5 <= baz <= 15.
         WorkingSet ws;
-        unique_ptr<AndHashStage> ah(new AndHashStage(&ws, coll, 5 * big.size()));
+        auto ah = make_unique<AndHashStage>(&_txn, &ws, coll, 5 * big.size());
 
         // Foo <= 20
         IndexScanParams params;
@@ -530,7 +531,7 @@ public:
         addIndex(BSON("baz" << 1));
 
         WorkingSet ws;
-        unique_ptr<AndHashStage> ah(new AndHashStage(&ws, coll));
+        auto ah = make_unique<AndHashStage>(&_txn, &ws, coll);
 
         // Foo <= 20
         IndexScanParams params;
@@ -597,7 +598,7 @@ public:
         // before hashed AND is done reading the second child (stage has to
         // hold 11 keys in buffer for Foo <= 20 and Bar >= 10).
         WorkingSet ws;
-        unique_ptr<AndHashStage> ah(new AndHashStage(&ws, coll, 10 * big.size()));
+        auto ah = make_unique<AndHashStage>(&_txn, &ws, coll, 10 * big.size());
 
         // Foo <= 20
         IndexScanParams params;
@@ -651,7 +652,7 @@ public:
         addIndex(BSON("bar" << 1));
 
         WorkingSet ws;
-        unique_ptr<AndHashStage> ah(new AndHashStage(&ws, coll));
+        auto ah = make_unique<AndHashStage>(&_txn, &ws, coll);
 
         // Foo <= 20
         IndexScanParams params;
@@ -714,7 +715,7 @@ public:
         addIndex(BSON("bar" << 1));
 
         WorkingSet ws;
-        unique_ptr<AndHashStage> ah(new AndHashStage(&ws, coll));
+        auto ah = make_unique<AndHashStage>(&_txn, &ws, coll);
 
         // Foo >= 100
         IndexScanParams params;
@@ -766,7 +767,7 @@ public:
         addIndex(BSON("bar" << 1));
 
         WorkingSet ws;
-        unique_ptr<AndHashStage> ah(new AndHashStage(&ws, coll));
+        auto ah = make_unique<AndHashStage>(&_txn, &ws, coll);
 
         // Foo <= 20
         IndexScanParams params;
@@ -825,7 +826,7 @@ public:
         addIndex(BSON("bar" << 1));
 
         WorkingSet ws;
-        unique_ptr<AndHashStage> ah(new AndHashStage(&ws, coll));
+        auto ah = make_unique<AndHashStage>(&_txn, &ws, coll);
 
         // Foo <= 20
         IndexScanParams params;
@@ -880,19 +881,19 @@ public:
         //     Child2:  NEED_TIME, DEAD
         {
             WorkingSet ws;
-            const std::unique_ptr<AndHashStage> andHashStage =
-                stdx::make_unique<AndHashStage>(&ws, coll);
+            const auto andHashStage = make_unique<AndHashStage>(&_txn, &ws, coll);
 
-            std::unique_ptr<QueuedDataStage> childStage1 = stdx::make_unique<QueuedDataStage>(&ws);
+            auto childStage1 = make_unique<QueuedDataStage>(&_txn, &ws);
             {
-                WorkingSetMember wsm;
-                wsm.state = WorkingSetMember::LOC_AND_UNOWNED_OBJ;
-                wsm.loc = RecordId(1);
-                wsm.obj = Snapshotted<BSONObj>(SnapshotId(), dataObj);
-                childStage1->pushBack(wsm);
+                WorkingSetID id = ws.allocate();
+                WorkingSetMember* wsm = ws.get(id);
+                wsm->loc = RecordId(1);
+                wsm->obj = Snapshotted<BSONObj>(SnapshotId(), dataObj);
+                ws.transitionToLocAndObj(id);
+                childStage1->pushBack(id);
             }
 
-            std::unique_ptr<QueuedDataStage> childStage2 = stdx::make_unique<QueuedDataStage>(&ws);
+            auto childStage2 = make_unique<QueuedDataStage>(&_txn, &ws);
             childStage2->pushBack(PlanStage::NEED_TIME);
             childStage2->pushBack(PlanStage::DEAD);
 
@@ -913,27 +914,28 @@ public:
         //     Child2:  Data
         {
             WorkingSet ws;
-            const std::unique_ptr<AndHashStage> andHashStage =
-                stdx::make_unique<AndHashStage>(&ws, coll);
+            const auto andHashStage = make_unique<AndHashStage>(&_txn, &ws, coll);
 
-            std::unique_ptr<QueuedDataStage> childStage1 = stdx::make_unique<QueuedDataStage>(&ws);
+            auto childStage1 = make_unique<QueuedDataStage>(&_txn, &ws);
 
             {
-                WorkingSetMember wsm;
-                wsm.state = WorkingSetMember::LOC_AND_UNOWNED_OBJ;
-                wsm.loc = RecordId(1);
-                wsm.obj = Snapshotted<BSONObj>(SnapshotId(), dataObj);
-                childStage1->pushBack(wsm);
+                WorkingSetID id = ws.allocate();
+                WorkingSetMember* wsm = ws.get(id);
+                wsm->loc = RecordId(1);
+                wsm->obj = Snapshotted<BSONObj>(SnapshotId(), dataObj);
+                ws.transitionToLocAndObj(id);
+                childStage1->pushBack(id);
             }
             childStage1->pushBack(PlanStage::DEAD);
 
-            std::unique_ptr<QueuedDataStage> childStage2 = stdx::make_unique<QueuedDataStage>(&ws);
+            auto childStage2 = make_unique<QueuedDataStage>(&_txn, &ws);
             {
-                WorkingSetMember wsm;
-                wsm.state = WorkingSetMember::LOC_AND_UNOWNED_OBJ;
-                wsm.loc = RecordId(2);
-                wsm.obj = Snapshotted<BSONObj>(SnapshotId(), dataObj);
-                childStage2->pushBack(wsm);
+                WorkingSetID id = ws.allocate();
+                WorkingSetMember* wsm = ws.get(id);
+                wsm->loc = RecordId(2);
+                wsm->obj = Snapshotted<BSONObj>(SnapshotId(), dataObj);
+                ws.transitionToLocAndObj(id);
+                childStage2->pushBack(id);
             }
 
             andHashStage->addChild(childStage1.release());
@@ -953,25 +955,26 @@ public:
         //     Child2:  Data, DEAD
         {
             WorkingSet ws;
-            const std::unique_ptr<AndHashStage> andHashStage =
-                stdx::make_unique<AndHashStage>(&ws, coll);
+            const auto andHashStage = make_unique<AndHashStage>(&_txn, &ws, coll);
 
-            std::unique_ptr<QueuedDataStage> childStage1 = stdx::make_unique<QueuedDataStage>(&ws);
+            auto childStage1 = make_unique<QueuedDataStage>(&_txn, &ws);
             {
-                WorkingSetMember wsm;
-                wsm.state = WorkingSetMember::LOC_AND_UNOWNED_OBJ;
-                wsm.loc = RecordId(1);
-                wsm.obj = Snapshotted<BSONObj>(SnapshotId(), dataObj);
-                childStage1->pushBack(wsm);
+                WorkingSetID id = ws.allocate();
+                WorkingSetMember* wsm = ws.get(id);
+                wsm->loc = RecordId(1);
+                wsm->obj = Snapshotted<BSONObj>(SnapshotId(), dataObj);
+                ws.transitionToLocAndObj(id);
+                childStage1->pushBack(id);
             }
 
-            std::unique_ptr<QueuedDataStage> childStage2 = stdx::make_unique<QueuedDataStage>(&ws);
+            auto childStage2 = make_unique<QueuedDataStage>(&_txn, &ws);
             {
-                WorkingSetMember wsm;
-                wsm.state = WorkingSetMember::LOC_AND_UNOWNED_OBJ;
-                wsm.loc = RecordId(2);
-                wsm.obj = Snapshotted<BSONObj>(SnapshotId(), dataObj);
-                childStage2->pushBack(wsm);
+                WorkingSetID id = ws.allocate();
+                WorkingSetMember* wsm = ws.get(id);
+                wsm->loc = RecordId(2);
+                wsm->obj = Snapshotted<BSONObj>(SnapshotId(), dataObj);
+                ws.transitionToLocAndObj(id);
+                childStage2->pushBack(id);
             }
             childStage2->pushBack(PlanStage::DEAD);
 
@@ -1017,7 +1020,7 @@ public:
         addIndex(BSON("bar" << 1));
 
         WorkingSet ws;
-        unique_ptr<AndSortedStage> ah(new AndSortedStage(&ws, coll));
+        auto ah = make_unique<AndSortedStage>(&_txn, &ws, coll);
 
         // Scan over foo == 1
         IndexScanParams params;
@@ -1051,12 +1054,12 @@ public:
         ah->saveState();
         ah->invalidate(&_txn, *data.begin(), INVALIDATION_DELETION);
         remove(coll->docFor(&_txn, *data.begin()).value());
-        ah->restoreState(&_txn);
+        ah->restoreState();
 
         // Make sure the nuked obj is actually in the flagged data.
         ASSERT_EQUALS(ws.getFlagged().size(), size_t(1));
         WorkingSetMember* member = ws.get(*ws.getFlagged().begin());
-        ASSERT_EQUALS(WorkingSetMember::OWNED_OBJ, member->state);
+        ASSERT_EQUALS(WorkingSetMember::OWNED_OBJ, member->getState());
         BSONElement elt;
         ASSERT_TRUE(member->getFieldDotted("foo", &elt));
         ASSERT_EQUALS(1, elt.numberInt());
@@ -1094,7 +1097,7 @@ public:
         ah->saveState();
         ah->invalidate(&_txn, *it, INVALIDATION_DELETION);
         remove(coll->docFor(&_txn, *it).value());
-        ah->restoreState(&_txn);
+        ah->restoreState();
 
         // Get all results aside from the two we killed.
         while (!ah->isEOF()) {
@@ -1150,7 +1153,7 @@ public:
         addIndex(BSON("baz" << 1));
 
         WorkingSet ws;
-        unique_ptr<AndSortedStage> ah(new AndSortedStage(&ws, coll));
+        auto ah = make_unique<AndSortedStage>(&_txn, &ws, coll);
 
         // Scan over foo == 1
         IndexScanParams params;
@@ -1195,7 +1198,7 @@ public:
         addIndex(BSON("bar" << 1));
 
         WorkingSet ws;
-        unique_ptr<AndSortedStage> ah(new AndSortedStage(&ws, coll));
+        auto ah = make_unique<AndSortedStage>(&_txn, &ws, coll);
 
         // Foo == 7.  Should be EOF.
         IndexScanParams params;
@@ -1244,7 +1247,7 @@ public:
         addIndex(BSON("bar" << 1));
 
         WorkingSet ws;
-        unique_ptr<AndSortedStage> ah(new AndSortedStage(&ws, coll));
+        auto ah = make_unique<AndSortedStage>(&_txn, &ws, coll);
 
         // foo == 7.
         IndexScanParams params;
@@ -1289,7 +1292,7 @@ public:
         addIndex(BSON("bar" << 1));
 
         WorkingSet ws;
-        unique_ptr<AndHashStage> ah(new AndHashStage(&ws, coll));
+        auto ah = make_unique<AndHashStage>(&_txn, &ws, coll);
 
         // Scan over foo == 1
         IndexScanParams params;
@@ -1355,7 +1358,7 @@ public:
         addIndex(BSON("bar" << 1));
 
         WorkingSet ws;
-        unique_ptr<AndSortedStage> as(new AndSortedStage(&ws, coll));
+        unique_ptr<AndSortedStage> as = make_unique<AndSortedStage>(&_txn, &ws, coll);
 
         // Scan over foo == 1
         IndexScanParams params;
@@ -1409,7 +1412,7 @@ public:
         addIndex(BSON("bar" << 1));
 
         WorkingSet ws;
-        unique_ptr<AndSortedStage> as(new AndSortedStage(&ws, coll));
+        unique_ptr<AndSortedStage> as = make_unique<AndSortedStage>(&_txn, &ws, coll);
 
         // Scan over foo == 1
         IndexScanParams params;

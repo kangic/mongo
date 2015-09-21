@@ -1,9 +1,13 @@
+command_type: system
 stepback: false
 
 pre:
     - command: shell.track
 
 post:
+    - command: attach.results
+      params:
+        file_location: src/report.json
     - command: shell.cleanup
 
 functions:
@@ -37,7 +41,7 @@ functions:
           chmod +x mongo
           git clone https://github.com/mongodb/mongo-perf perf
           cd perf
-          git checkout evergreen
+          git checkout r20150814
     - command: shell.exec
       params:
         background: true
@@ -51,6 +55,50 @@ functions:
           # if we started a replset, initiate it and wait for it to become primary
           ./mongo --eval "if(db.isMaster().isreplicaset){rs.initiate(); assert.soon(function(){return db.isMaster().ismaster}, 'no primary')}"
           echo "MONGOD STARTED."
+  "analyze":
+    - command: s3.get
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        remote_file: perf/${build_variant}/${revision}/perf_regression_check.py-${build_id}
+        bucket: mciuploads
+        local_file: src/perf_regression_check.py
+    - command: s3.get
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        remote_file: perf/${build_variant}/${revision}/override.json-${build_id}
+        bucket: mciuploads
+        local_file: src/override.json
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: |
+          set -e
+          set -v
+          virtualenv ./venv
+          source ./venv/bin/activate
+          pip install argparse python-dateutil
+    - command: json.get_history
+      params:
+        task: ${task_name}
+        file: "src/history.json"
+        name: "perf"
+    - command: json.get_history
+      params:
+        tags: true
+        task: ${task_name}
+        file: "src/tags.json"
+        name: "perf"
+    - command: shell.exec
+      type : test
+      params:
+        working_dir: src
+        script: |
+          set -o errexit
+          set -o verbose
+          source ./venv/bin/activate
+          python perf_regression_check.py -f history.json --rev ${revision} -t tags.json --refTag 3.0.6-Baseline --overrideFile override.json --variant ${build_variant} --threshold 0.15 --threadThreshold 0.25
   "run perf tests":
     - command: shell.exec
       params:
@@ -61,18 +109,17 @@ functions:
           virtualenv ./venv
           source ./venv/bin/activate
           pip install argparse
-
     - command: shell.exec
       params:
         working_dir: src
         script: |
-          set -e 
+          set -e
           set -v
           source ./venv/bin/activate
           cd perf
           #  give mongod a few seconds to start up so that we can connect.
           sleep 5
-          ${perf_exec_wrapper} python benchrun.py --shell ../mongo -t 1 2 4 8 16 --trialCount 7 -f testcases/*.js --testFilter '${filter}' --out perf.json
+          ${perf_exec_wrapper} python benchrun.py --shell ../mongo -t ${threads} --trialCount 5 -f testcases/*.js --includeFilter ${includeFilter1}  --includeFilter ${includeFilter2} --excludeFilter ${excludeFilter} --out perf.json --exclude-testbed
     - command: "json.send"
       params:
         name: "perf"
@@ -115,6 +162,26 @@ tasks:
         permissions: public-read
         content_type: ${content_type|application/octet-stream}
         display_name: mongo
+    - command: s3.put
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file: src/buildscripts/perf_regression_check.py
+        remote_file: perf/${build_variant}/${revision}/perf_regression_check.py-${build_id}
+        bucket: mciuploads
+        permissions: public-read
+        content_type: ${content_type|application/octet-stream}
+        display_name: perf_regression_check.py
+    - command: s3.put
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file: src/etc/override.json
+        remote_file: perf/${build_variant}/${revision}/override.json-${build_id}
+        bucket: mciuploads
+        permissions: public-read
+        content_type: ${content_type|application/octet-stream}
+        display_name: override.json
 
 - name: query
   depends_on:
@@ -123,7 +190,23 @@ tasks:
     - func: "start server"
     - func: "run perf tests"
       vars:
-        filter: "core-query"
+        includeFilter1: "query"
+        includeFilter2 : "core regression" 
+        excludeFilter : "single_threaded"
+        threads : "1 2 4 8"
+    - func: "analyze"
+- name: where
+  depends_on:
+  - name: compile
+  commands:
+    - func: "start server"
+    - func: "run perf tests"
+      vars:
+        includeFilter1: "where"
+        includeFilter2 : "core regression" 
+        excludeFilter : "single_threaded"
+        threads : "1 2 4 8"
+    - func: "analyze"
 - name: update
   depends_on:
   - name: compile
@@ -131,7 +214,11 @@ tasks:
     - func: "start server"
     - func: "run perf tests"
       vars:
-        filter: "core-update"
+        includeFilter1: "update"
+        includeFilter2 : "core regression" 
+        excludeFilter : "single_threaded"
+        threads : "1 2 4 8"
+    - func: "analyze"
 - name: insert
   depends_on:
   - name: compile
@@ -139,15 +226,56 @@ tasks:
     - func: "start server"
     - func: "run perf tests"
       vars:
-        filter: "core-insert"
+        includeFilter1: "insert"
+        includeFilter2 : "core regression" 
+        excludeFilter : "single_threaded"
+        threads : "1 2 4 8"
+    - func: "analyze"
+- name: geo
+  depends_on:
+  - name: compile
+  commands:
+    - func: "start server"
+    - func: "run perf tests"
+      vars:
+        includeFilter1: "geo"
+        includeFilter2 : "core regression" 
+        excludeFilter : "single_threaded"
+        threads : "1 2 4 8"
+    - func: "analyze"
+- name: misc
+  depends_on:
+  - name: compile
+  commands:
+    - func: "start server"
+    - func: "run perf tests"
+      vars:
+        includeFilter1: "command multi remove mixed"
+        includeFilter2 : "core regression" 
+        excludeFilter : "single_threaded"
+        threads : "1 2 4 8"
+    - func: "analyze"
+- name: singleThreaded
+  depends_on:
+  - name: compile
+  commands:
+    - func: "start server"
+    - func: "run perf tests"
+      vars:
+        includeFilter1: "single_threaded"
+        includeFilter2 : "core regression" 
+        excludeFilter : "none"
+        threads : "1"
+    - func: "analyze"
 
 buildvariants:
 - name: linux-wt-standalone
   display_name: Linux WT Standalone
+  batchtime: 90 # 1.5 hours
   expansions:
-    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/bin/gcc CXX=/opt/mongodbtoolchain/bin/g++ --release
-    mongod_exec_wrapper: "numactl --physcpubind=4,5,6,7 -i 1"
-    perf_exec_wrapper: "numactl --physcpubind=1,2,3 -i 0"
+    compile_flags: &compile_flags -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/bin/gcc CXX=/opt/mongodbtoolchain/bin/g++ --release
+    mongod_exec_wrapper: &exec_wrapper "numactl --physcpubind=4,5,6,7 -i 1"
+    perf_exec_wrapper: &perf_wrapper "numactl --physcpubind=1,2,3 -i 0"
     mongod_flags: "--storageEngine=wiredTiger --logpath ./mongod.log --fork --syncdelay 0 --nojournal --setParameter ttlMonitorEnabled=false --wiredTigerCacheSizeGB 16"
 
   run_on:
@@ -157,16 +285,21 @@ buildvariants:
     distros:
     - rhel55
   - name: query
+  - name: where
   - name: update
   - name: insert
+  - name: geo
+  - name: misc
+  - name: singleThreaded
 
-- name: linux-wt-repl
-  display_name: Linux WT 1-Node ReplSet
+- name: linux-mmap-standalone
+  display_name: Linux MMAPv1 Standalone
+  batchtime: 90 # 1.5 hours
   expansions:
-    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/bin/gcc CXX=/opt/mongodbtoolchain/bin/g++ --release
-    mongod_exec_wrapper: "numactl --physcpubind=4,5,6,7 -i 1"
-    perf_exec_wrapper: "numactl --physcpubind=1,2,3 -i 0"
-    mongod_flags: "--replSet=test --storageEngine=wiredTiger --logpath ./mongod.log --fork --syncdelay 0 --nojournal --setParameter ttlMonitorEnabled=false --wiredTigerCacheSizeGB 16"
+    compile_flags: *compile_flags
+    mongod_exec_wrapper: *exec_wrapper
+    perf_exec_wrapper: *perf_wrapper
+    mongod_flags: "--storageEngine=mmapv1 --logpath ./mongod.log --fork --syncdelay 0 --nojournal --setParameter ttlMonitorEnabled=false"
 
   run_on:
   - "centos6-perf"
@@ -175,5 +308,49 @@ buildvariants:
     distros:
     - rhel55
   - name: query
+  - name: where
   - name: update
   - name: insert
+  - name: geo
+  - name: misc
+  - name: singleThreaded
+
+- name: linux-wt-repl
+  display_name: Linux WT 1-Node ReplSet
+  batchtime: 360 # 6 hours
+  expansions:
+    compile_flags: *compile_flags 
+    mongod_exec_wrapper: *exec_wrapper
+    perf_exec_wrapper: *perf_wrapper
+    mongod_flags: "--replSet=test --storageEngine=wiredTiger --logpath ./mongod.log --fork --syncdelay 0 --nojournal --setParameter ttlMonitorEnabled=false --wiredTigerCacheSizeGB 16 --oplogSize 100000"
+
+  run_on:
+  - "centos6-perf"
+  tasks:
+  - name: compile
+    distros:
+    - rhel55
+  - name: update
+  - name: insert
+  - name: misc
+  - name: singleThreaded
+
+- name: linux-mmap-repl
+  display_name: Linux MMapv1 1-Node ReplSet
+  batchtime: 360 # 6 hours
+  expansions:
+    compile_flags: *compile_flags 
+    mongod_exec_wrapper: *exec_wrapper
+    perf_exec_wrapper: *perf_wrapper
+    mongod_flags: "--replSet=test --storageEngine=mmapv1 --logpath ./mongod.log --fork --syncdelay 0 --nojournal --setParameter ttlMonitorEnabled=false --oplogSize 100000"
+
+  run_on:
+  - "centos6-perf"
+  tasks:
+  - name: compile
+    distros:
+    - rhel55
+  - name: update
+  - name: insert
+  - name: misc
+  - name: singleThreaded

@@ -94,7 +94,6 @@ void truncateAndResetOplog(OperationContext* txn,
     // because the bgsync thread, while running, may update the blacklist.
     replCoord->resetMyLastOptime();
     bgsync->stop();
-    bgsync->setLastAppliedHash(0);
     bgsync->clearBuffer();
 
     replCoord->clearSyncSourceBlacklist();
@@ -186,7 +185,7 @@ bool _initialSyncClone(OperationContext* txn,
         options.useReplAuth = true;
         options.snapshot = false;
         options.mayYield = true;
-        options.mayBeInterrupted = false;
+        options.mayBeInterrupted = true;
         options.syncData = dataPass;
         options.syncIndexes = !dataPass;
 
@@ -254,14 +253,14 @@ bool _initialSyncApplyOplog(OperationContext* ctx, repl::SyncTail& syncer, Oplog
         return false;
     }
 
-    OpTime stopOpTime = extractOpTime(lastOp);
+    OpTime stopOpTime = fassertStatusOK(28777, OpTime::parseFromOplogEntry(lastOp));
 
     // If we already have what we need then return.
     if (stopOpTime == startOpTime)
         return true;
 
     verify(!stopOpTime.isNull());
-    verify(stopOpTime > startOpTime);
+    verify(stopOpTime.getTimestamp() > startOpTime.getTimestamp());
 
     // apply till stopOpTime
     try {
@@ -278,33 +277,6 @@ bool _initialSyncApplyOplog(OperationContext* ctx, repl::SyncTail& syncer, Oplog
     }
 
     return true;
-}
-
-void _tryToApplyOpWithRetry(OperationContext* txn, SyncTail* init, const BSONObj& op) {
-    try {
-        if (!SyncTail::syncApply(txn, op, false).isOK()) {
-            bool retry;
-            {
-                ScopedTransaction transaction(txn, MODE_X);
-                Lock::GlobalWrite lk(txn->lockState());
-                retry = init->shouldRetry(txn, op);
-            }
-
-            if (retry) {
-                // retry
-                if (!SyncTail::syncApply(txn, op, false).isOK()) {
-                    uasserted(28542,
-                              str::stream() << "During initial sync, failed to apply op: " << op);
-                }
-            }
-            // If shouldRetry() returns false, fall through.
-            // This can happen if the document that was moved and missed by Cloner
-            // subsequently got deleted and no longer exists on the Sync Target at all
-        }
-    } catch (const DBException& e) {
-        error() << "exception: " << causedBy(e) << " on: " << op.toString();
-        uasserted(28541, str::stream() << "During initial sync, failed to apply op: " << op);
-    }
 }
 
 /**
@@ -345,13 +317,11 @@ Status _initialSync() {
     truncateAndResetOplog(&txn, replCoord, bgsync);
 
     OplogReader r;
-    Timestamp now(duration_cast<Seconds>(Milliseconds(curTimeMillis64())), 0);
-    OpTime nowOpTime(now, std::numeric_limits<long long>::max());
 
     while (r.getHost().empty()) {
         // We must prime the sync source selector so that it considers all candidates regardless
-        // of oplog position, by passing in "now" with max term as the last op fetched time.
-        r.connectToSyncSource(&txn, nowOpTime, replCoord);
+        // of oplog position, by passing in null OpTime as the last op fetched time.
+        r.connectToSyncSource(&txn, OpTime(), replCoord);
         if (r.getHost().empty()) {
             std::string msg =
                 "no valid sync sources found in current replset to do an initial sync";
@@ -399,12 +369,8 @@ Status _initialSync() {
 
     log() << "initial sync data copy, starting syncup";
 
-    // prime oplog
-    _tryToApplyOpWithRetry(&txn, &init, lastOp);
-    std::deque<BSONObj> ops;
-    ops.push_back(lastOp);
-
-    OpTime lastOptime = writeOpsToOplog(&txn, ops);
+    // prime oplog, but don't need to actually apply the op as the cloned data already reflects it.
+    OpTime lastOptime = writeOpsToOplog(&txn, {lastOp});
     ReplClientInfo::forClient(txn.getClient()).setLastOp(lastOptime);
     replCoord->setMyLastOptime(lastOptime);
     setNewTimestamp(lastOptime.getTimestamp());

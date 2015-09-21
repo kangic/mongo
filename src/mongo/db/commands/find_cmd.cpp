@@ -42,18 +42,27 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/query/cursor_responses.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/find.h"
+#include "mongo/db/query/find_common.h"
 #include "mongo/db/query/get_executor.h"
+#include "mongo/db/s/operation_shard_version.h"
+#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/stats/counters.h"
-#include "mongo/s/d_state.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
+
+namespace {
+
+const char kTermField[] = "term";
+
+}  // namespace
 
 /**
  * A command for running .find() queries.
@@ -84,6 +93,10 @@ public:
         return false;
     }
 
+    bool supportsReadConcern() const final {
+        return true;
+    }
+
     void help(std::stringstream& help) const override {
         help << "query for documents";
     }
@@ -99,20 +112,16 @@ public:
     Status checkAuthForCommand(ClientBasic* client,
                                const std::string& dbname,
                                const BSONObj& cmdObj) override {
-        AuthorizationSession* authzSession = AuthorizationSession::get(client);
-        ResourcePattern pattern = parseResourcePattern(dbname, cmdObj);
-
-        if (authzSession->isAuthorizedForActionsOnResource(pattern, ActionType::find)) {
-            return Status::OK();
-        }
-
-        return Status(ErrorCodes::Unauthorized, "unauthorized");
+        NamespaceString nss(parseNs(dbname, cmdObj));
+        auto hasTerm = cmdObj.hasField(kTermField);
+        return AuthorizationSession::get(client)->checkAuthForFind(nss, hasTerm);
     }
 
     Status explain(OperationContext* txn,
                    const std::string& dbname,
                    const BSONObj& cmdObj,
                    ExplainCommon::Verbosity verbosity,
+                   const rpc::ServerSelectionMetadata&,
                    BSONObjBuilder* out) const override {
         const std::string fullns = parseNs(dbname, cmdObj);
         const NamespaceString nss(fullns);
@@ -129,17 +138,14 @@ public:
         }
 
         // Finish the parsing step by using the LiteParsedQuery to create a CanonicalQuery.
-        std::unique_ptr<CanonicalQuery> cq;
-        {
-            CanonicalQuery* rawCq;
-            WhereCallbackReal whereCallback(txn, nss.db());
-            Status canonStatus =
-                CanonicalQuery::canonicalize(lpqStatus.getValue().release(), &rawCq, whereCallback);
-            if (!canonStatus.isOK()) {
-                return canonStatus;
-            }
-            cq.reset(rawCq);
+
+        WhereCallbackReal whereCallback(txn, nss.db());
+        auto statusWithCQ =
+            CanonicalQuery::canonicalize(lpqStatus.getValue().release(), whereCallback);
+        if (!statusWithCQ.isOK()) {
+            return statusWithCQ.getStatus();
         }
+        std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
         AutoGetCollectionForRead ctx(txn, nss);
         // The collection may be NULL. If so, getExecutor() should handle it by returning
@@ -147,16 +153,12 @@ public:
         Collection* collection = ctx.getCollection();
 
         // We have a parsed query. Time to get the execution plan for it.
-        std::unique_ptr<PlanExecutor> exec;
-        {
-            PlanExecutor* rawExec;
-            Status execStatus = getExecutorFind(
-                txn, collection, nss, cq.release(), PlanExecutor::YIELD_AUTO, &rawExec);
-            if (!execStatus.isOK()) {
-                return execStatus;
-            }
-            exec.reset(rawExec);
+        auto statusWithPlanExecutor =
+            getExecutorFind(txn, collection, nss, std::move(cq), PlanExecutor::YIELD_AUTO);
+        if (!statusWithPlanExecutor.isOK()) {
+            return statusWithPlanExecutor.getStatus();
         }
+        std::unique_ptr<PlanExecutor> exec = std::move(statusWithPlanExecutor.getValue());
 
         // Got the execution tree. Explain it.
         Explain::explainStages(exec.get(), verbosity, out);
@@ -172,10 +174,6 @@ public:
      *   5) Generate the first batch.
      *   6) Save state for getMore.
      *   7) Generate response to send to the client.
-     *
-     * TODO: Rather than using the sharding version available in thread-local storage
-     * (i.e. call to shardingState.needCollectionMetadata() below), shard version
-     * information should be passed as part of the command parameter.
      */
     bool run(OperationContext* txn,
              const std::string& dbname,
@@ -185,7 +183,7 @@ public:
              BSONObjBuilder& result) override {
         const std::string fullns = parseNs(dbname, cmdObj);
         const NamespaceString nss(fullns);
-        if (!nss.isValid()) {
+        if (!nss.isValid() || nss.isCommand() || nss.isSpecialCommand()) {
             return appendCommandStatus(result,
                                        {ErrorCodes::InvalidNamespace,
                                         str::stream() << "Invalid collection name: " << nss.ns()});
@@ -209,20 +207,37 @@ public:
 
         auto& lpq = lpqStatus.getValue();
 
+        // Validate term, if provided.
+        if (auto term = lpq->getReplicationTerm()) {
+            auto replCoord = repl::ReplicationCoordinator::get(txn);
+            Status status = replCoord->updateTerm(*term);
+            // Note: updateTerm returns ok if term stayed the same.
+            if (!status.isOK()) {
+                return appendCommandStatus(result, status);
+            }
+        }
+
         // Fill out curop information.
-        int ntoreturn = lpq->getBatchSize().value_or(0);
-        beginQueryOp(txn, nss, cmdObj, ntoreturn, lpq->getSkip());
+        long long ntoreturn = lpq->getNToReturn().value_or(0);
+        beginQueryOp(txn, nss, cmdObj, ntoreturn, lpq->getSkip().value_or(0));
 
         // 1b) Finish the parsing step by using the LiteParsedQuery to create a CanonicalQuery.
-        std::unique_ptr<CanonicalQuery> cq;
-        {
-            CanonicalQuery* rawCq;
-            WhereCallbackReal whereCallback(txn, nss.db());
-            Status canonStatus = CanonicalQuery::canonicalize(lpq.release(), &rawCq, whereCallback);
-            if (!canonStatus.isOK()) {
-                return appendCommandStatus(result, canonStatus);
-            }
-            cq.reset(rawCq);
+        WhereCallbackReal whereCallback(txn, nss.db());
+        auto statusWithCQ = CanonicalQuery::canonicalize(lpq.release(), whereCallback);
+        if (!statusWithCQ.isOK()) {
+            return appendCommandStatus(result, statusWithCQ.getStatus());
+        }
+        std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
+
+        // If the received version is newer than the version cached in 'shardingState', then we have
+        // to refresh 'shardingState' from the config servers. We do this before acquiring locks so
+        // that we don't hold locks while waiting on the network.
+        ShardingState* const shardingState = ShardingState::get(txn);
+        if (OperationShardVersion::get(txn).hasShardVersion() && shardingState->enabled()) {
+            ChunkVersion receivedVersion = OperationShardVersion::get(txn).getShardVersion(nss);
+            ChunkVersion latestVersion;
+            uassertStatusOK(shardingState->refreshMetadataIfNeeded(
+                txn, nss.ns(), receivedVersion, &latestVersion));
         }
 
         // 2) Acquire locks.
@@ -235,78 +250,77 @@ public:
         // It is possible that the sharding version will change during yield while we are
         // retrieving a plan executor. If this happens we will throw an error and mongos will
         // retry.
-        const ChunkVersion shardingVersionAtStart = shardingState.getVersion(nss.ns());
+        const ChunkVersion shardingVersionAtStart = shardingState->getVersion(nss.ns());
 
         // 3) Get the execution plan for the query.
-        std::unique_ptr<PlanExecutor> execHolder;
-        {
-            PlanExecutor* rawExec;
-            Status execStatus = getExecutorFind(
-                txn, collection, nss, cq.release(), PlanExecutor::YIELD_AUTO, &rawExec);
-            if (!execStatus.isOK()) {
-                return appendCommandStatus(result, execStatus);
-            }
-            execHolder.reset(rawExec);
+        auto statusWithPlanExecutor =
+            getExecutorFind(txn, collection, nss, std::move(cq), PlanExecutor::YIELD_AUTO);
+        if (!statusWithPlanExecutor.isOK()) {
+            return appendCommandStatus(result, statusWithPlanExecutor.getStatus());
         }
+
+        std::unique_ptr<PlanExecutor> exec = std::move(statusWithPlanExecutor.getValue());
 
         // TODO: Currently, chunk ranges are kept around until all ClientCursors created while
         // the chunk belonged on this node are gone. Separating chunk lifetime management from
         // ClientCursor should allow this check to go away.
-        if (!shardingState.getVersion(nss.ns()).isWriteCompatibleWith(shardingVersionAtStart)) {
+        if (!shardingState->getVersion(nss.ns()).isWriteCompatibleWith(shardingVersionAtStart)) {
             // Version changed while retrieving a PlanExecutor. Terminate the operation,
             // signaling that mongos should retry.
             throw SendStaleConfigException(nss.ns(),
                                            "version changed during find command",
                                            shardingVersionAtStart,
-                                           shardingState.getVersion(nss.ns()));
+                                           shardingState->getVersion(nss.ns()));
         }
 
         if (!collection) {
             // No collection. Just fill out curop indicating that there were zero results and
             // there is no ClientCursor id, and then return.
-            const int numResults = 0;
+            const long long numResults = 0;
             const CursorId cursorId = 0;
-            endQueryOp(txn, execHolder.get(), dbProfilingLevel, numResults, cursorId);
+            endQueryOp(txn, collection, *exec, dbProfilingLevel, numResults, cursorId);
             appendCursorResponseObject(cursorId, nss.ns(), BSONArray(), &result);
             return true;
         }
 
-        const LiteParsedQuery& pq = execHolder->getCanonicalQuery()->getParsed();
+        const LiteParsedQuery& pq = exec->getCanonicalQuery()->getParsed();
 
         // 4) If possible, register the execution plan inside a ClientCursor, and pin that
         // cursor. In this case, ownership of the PlanExecutor is transferred to the
         // ClientCursor, and 'exec' becomes null.
         //
         // First unregister the PlanExecutor so it can be re-registered with ClientCursor.
-        execHolder->deregisterExec();
+        exec->deregisterExec();
 
         // Create a ClientCursor containing this plan executor. We don't have to worry
         // about leaking it as it's inserted into a global map by its ctor.
-        ClientCursor* cursor = new ClientCursor(collection->getCursorManager(),
-                                                execHolder.release(),
-                                                nss.ns(),
-                                                pq.getOptions(),
-                                                pq.getFilter());
+        ClientCursor* cursor =
+            new ClientCursor(collection->getCursorManager(),
+                             exec.release(),
+                             nss.ns(),
+                             txn->recoveryUnit()->isReadingFromMajorityCommittedSnapshot(),
+                             pq.getOptions(),
+                             pq.getFilter());
         CursorId cursorId = cursor->cursorid();
         ClientCursorPin ccPin(collection->getCursorManager(), cursorId);
 
         // On early return, get rid of the the cursor.
         ScopeGuard cursorFreer = MakeGuard(&ClientCursorPin::deleteUnderlying, ccPin);
 
-        invariant(!execHolder);
-        PlanExecutor* exec = cursor->getExecutor();
+        invariant(!exec);
+        PlanExecutor* cursorExec = cursor->getExecutor();
 
         // 5) Stream query results, adding them to a BSONArray as we go.
         BSONArrayBuilder firstBatch;
         BSONObj obj;
-        PlanExecutor::ExecState state;
-        int numResults = 0;
-        while (!enoughForFirstBatch(pq, numResults, firstBatch.len()) &&
-               PlanExecutor::ADVANCED == (state = exec->getNext(&obj, NULL))) {
+        PlanExecutor::ExecState state = PlanExecutor::ADVANCED;
+        long long numResults = 0;
+        while (!FindCommon::enoughForFirstBatch(pq, numResults, firstBatch.len()) &&
+               PlanExecutor::ADVANCED == (state = cursorExec->getNext(&obj, NULL))) {
             // If adding this object will cause us to exceed the BSON size limit, then we stash
             // it for later.
             if (firstBatch.len() + obj.objsize() > BSONObjMaxUserSize && numResults > 0) {
-                exec->enqueue(obj);
+                cursorExec->enqueue(obj);
                 break;
             }
 
@@ -317,7 +331,7 @@ public:
 
         // Throw an assertion if query execution fails for any reason.
         if (PlanExecutor::FAILURE == state || PlanExecutor::DEAD == state) {
-            const std::unique_ptr<PlanStageStats> stats(exec->getStats());
+            const std::unique_ptr<PlanStageStats> stats(cursorExec->getStats());
             error() << "Plan executor error during find command: " << PlanExecutor::statestr(state)
                     << ", stats: " << Explain::statsToBSON(*stats);
 
@@ -329,29 +343,19 @@ public:
         }
 
         // 6) Set up the cursor for getMore.
-        if (shouldSaveCursor(txn, collection, state, exec)) {
+        if (shouldSaveCursor(txn, collection, state, cursorExec)) {
             // State will be restored on getMore.
-            exec->saveState();
+            cursorExec->saveState();
+            cursorExec->detachFromOperationContext();
 
             cursor->setLeftoverMaxTimeMicros(CurOp::get(txn)->getRemainingMaxTimeMicros());
             cursor->setPos(numResults);
-
-            // Don't stash the RU for tailable cursors at EOF, let them get a new RU on their
-            // next getMore.
-            if (!(pq.isTailable() && state == PlanExecutor::IS_EOF)) {
-                // We stash away the RecoveryUnit in the ClientCursor. It's used for
-                // subsequent getMore requests. The calling OpCtx gets a fresh RecoveryUnit.
-                txn->recoveryUnit()->abandonSnapshot();
-                cursor->setOwnedRecoveryUnit(txn->releaseRecoveryUnit());
-                StorageEngine* engine = getGlobalServiceContext()->getGlobalStorageEngine();
-                txn->setRecoveryUnit(engine->newRecoveryUnit(), OperationContext::kNotInUnitOfWork);
-            }
         } else {
             cursorId = 0;
         }
 
         // Fill out curop based on the results.
-        endQueryOp(txn, exec, dbProfilingLevel, numResults, cursorId);
+        endQueryOp(txn, collection, *cursorExec, dbProfilingLevel, numResults, cursorId);
 
         // 7) Generate the response object to send to the client.
         appendCursorResponseObject(cursorId, nss.ns(), firstBatch.arr(), &result);

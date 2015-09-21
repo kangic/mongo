@@ -59,6 +59,10 @@ namespace mutablebson {
 class Document;
 }  // namespace mutablebson
 
+namespace rpc {
+class ServerSelectionMetadata;
+}  // namespace rpc
+
 /** mongodb "commands" (sent via db.$cmd.findOne(...))
     subclass to make a command.  define a singleton object for it.
     */
@@ -171,11 +175,17 @@ public:
      *
      *   2) Calling Explain::explainStages(...) on the PlanExecutor. This is the function
      *   which knows how to convert an execution stage tree into explain output.
+     *
+     * TODO: Remove the 'serverSelectionMetadata' parameter in favor of reading the
+     * ServerSelectionMetadata off 'txn'. Once OP_COMMAND is implemented in mongos, this metadata
+     * will be parsed and attached as a decoration on the OperationContext, as is already done on
+     * the mongod side.
      */
     virtual Status explain(OperationContext* txn,
                            const std::string& dbname,
                            const BSONObj& cmdObj,
                            ExplainCommon::Verbosity verbosity,
+                           const rpc::ServerSelectionMetadata& serverSelectionMetadata,
                            BSONObjBuilder* out) const {
         return Status(ErrorCodes::IllegalOperation, "Cannot explain cmd: " + name);
     }
@@ -213,6 +223,22 @@ public:
      */
     virtual bool maintenanceOk() const {
         return true; /* assumed true prior to commit */
+    }
+
+    /**
+     * Returns true if this Command supports the readConcern argument.
+     *
+     * If the readConcern argument is sent to a command that returns false the command processor
+     * will reject the command, returning an appropriate error message. For commands that support
+     * the argument, the command processor will instruct the RecoveryUnit to only return
+     * "committed" data, failing if this isn't supported by the storage engine.
+     *
+     * Note that this is never called on mongos. Sharded commands are responsible for forwarding
+     * the option to the shards as needed. We rely on the shards to fail the commands in the
+     * cases where it isn't supported.
+     */
+    virtual bool supportsReadConcern() const {
+        return false;
     }
 
     /** @param webUI expose the command in the web ui as localhost:28017/<name>
@@ -268,8 +294,8 @@ public:
     // Counter for unknown commands
     static Counter64 unknownCommands;
 
-    /** @return if command was found */
-    static void runAgainstRegistered(const char* ns,
+    static void runAgainstRegistered(OperationContext* txn,
+                                     const char* ns,
                                      BSONObj& jsobj,
                                      BSONObjBuilder& anObjBuilder,
                                      int queryOptions = 0);

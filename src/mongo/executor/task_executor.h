@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2014-2015 MongoDB Inc.
+ *    Copyright (C) 2015 MongoDB Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -30,12 +30,14 @@
 
 #include <string>
 #include <memory>
+#include <functional>
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
-#include "mongo/client/remote_command_runner.h"
+#include "mongo/executor/remote_command_request.h"
+#include "mongo/executor/remote_command_response.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/util/time_support.h"
 
@@ -102,9 +104,30 @@ public:
     virtual ~TaskExecutor();
 
     /**
-     * Signals to the executor that it should shut down.
+     * Causes the executor to initialize its internal state (start threads if appropriate, create
+     * network sockets, etc). This method may be called at most once for the lifetime of an
+     * executor.
+     */
+    virtual void startup() = 0;
+
+    /**
+     * Signals to the executor that it should shut down. This method should not block. After
+     * calling shutdown, it is illegal to schedule more tasks on the executor and join should be
+     * called to wait for shutdown to complete.
+     *
+     * It is legal to call this method multiple times, but it should only be called after startup
+     * has been called.
      */
     virtual void shutdown() = 0;
+
+    /**
+     * Waits for the shutdown sequence initiated by an earlier call to shutdown to complete. It is
+     * only legal to call this method if startup has been called earlier.
+     *
+     * If startup is ever called, the code must ensure that join is eventually called once and only
+     * once.
+     */
+    virtual void join() = 0;
 
     /**
      * Returns diagnostic information.
@@ -247,6 +270,8 @@ class TaskExecutor::CallbackHandle {
 
 public:
     CallbackHandle();
+
+    // Exposed solely for testing.
     explicit CallbackHandle(std::shared_ptr<CallbackState> cbData);
 
     bool operator==(const CallbackHandle& other) const {
@@ -259,6 +284,17 @@ public:
 
     bool isValid() const {
         return _callback.get();
+    }
+
+    /**
+     * True if this handle is valid.
+     */
+    explicit operator bool() const {
+        return isValid();
+    }
+
+    std::size_t hash() const {
+        return std::hash<decltype(_callback)>()(_callback);
     }
 
 private:
@@ -312,6 +348,13 @@ public:
         return _event.get();
     }
 
+    /**
+     * True if this event handle is valid.
+     */
+    explicit operator bool() const {
+        return isValid();
+    }
+
 private:
     void setEvent(std::shared_ptr<EventState> event) {
         _event = event;
@@ -329,8 +372,8 @@ private:
  */
 struct TaskExecutor::CallbackArgs {
     CallbackArgs(TaskExecutor* theExecutor,
-                 const CallbackHandle& theHandle,
-                 const Status& theStatus,
+                 CallbackHandle theHandle,
+                 Status theStatus,
                  OperationContext* txn = NULL);
 
     TaskExecutor* executor;
@@ -356,3 +399,14 @@ struct TaskExecutor::RemoteCommandCallbackArgs {
 
 }  // namespace executor
 }  // namespace mongo
+
+// Provide a specialization for std::hash<CallbackHandle> so it can easily
+// be stored in unordered_set.
+namespace std {
+template <>
+struct hash<::mongo::executor::TaskExecutor::CallbackHandle> {
+    size_t operator()(const ::mongo::executor::TaskExecutor::CallbackHandle& x) const {
+        return x.hash();
+    }
+};
+}  // namespace std

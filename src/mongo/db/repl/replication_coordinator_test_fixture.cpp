@@ -57,6 +57,8 @@ bool stringContains(const std::string& haystack, const std::string& needle) {
 }  // namespace
 
 using executor::NetworkInterfaceMock;
+using executor::RemoteCommandRequest;
+using executor::RemoteCommandResponse;
 
 ReplicaSetConfig ReplCoordTest::assertMakeRSConfig(const BSONObj& configBson) {
     ReplicaSetConfig config;
@@ -64,9 +66,6 @@ ReplicaSetConfig ReplCoordTest::assertMakeRSConfig(const BSONObj& configBson) {
     ASSERT_OK(config.validate());
     return config;
 }
-
-ReplCoordTest::ReplCoordTest() : _callShutdown(false) {}
-ReplCoordTest::~ReplCoordTest() {}
 
 void ReplCoordTest::setUp() {
     _settings.replSet = "mySet/node1:12345,node2:54321";
@@ -105,12 +104,14 @@ void ReplCoordTest::init() {
     // PRNG seed for tests.
     const int64_t seed = 0;
 
-    _topo = new TopologyCoordinatorImpl(Seconds(0));
+    TopologyCoordinatorImpl::Options settings;
+    _topo = new TopologyCoordinatorImpl(settings);
     _net = new NetworkInterfaceMock;
     _storage = new StorageInterfaceMock;
+    _replExec.reset(new ReplicationExecutor(_net, _storage, seed));
     _externalState = new ReplicationCoordinatorExternalStateMock;
     _repl.reset(
-        new ReplicationCoordinatorImpl(_settings, _externalState, _net, _storage, _topo, seed));
+        new ReplicationCoordinatorImpl(_settings, _externalState, _topo, _replExec.get(), seed));
 }
 
 void ReplCoordTest::init(const ReplSettings& settings) {
@@ -160,18 +161,78 @@ void ReplCoordTest::assertStartSuccess(const BSONObj& configDoc, const HostAndPo
 
 ResponseStatus ReplCoordTest::makeResponseStatus(const BSONObj& doc, Milliseconds millis) {
     log() << "Responding with " << doc;
-    return ResponseStatus(RemoteCommandResponse(doc, millis));
+    return ResponseStatus(RemoteCommandResponse(doc, BSONObj(), millis));
+}
+
+void ReplCoordTest::simulateSuccessfulDryRun(
+    stdx::function<void(const RemoteCommandRequest& request)> onDryRunRequest) {
+    ReplicationCoordinatorImpl* replCoord = getReplCoord();
+    ReplicaSetConfig rsConfig = replCoord->getReplicaSetConfig_forTest();
+    NetworkInterfaceMock* net = getNet();
+
+    auto electionTimeoutWhen = replCoord->getElectionTimeout_forTest();
+    ASSERT_NOT_EQUALS(Date_t(), electionTimeoutWhen);
+    log() << "Election timeout scheduled at " << electionTimeoutWhen << " (simulator time)";
+
+    int voteRequests = 0;
+    int votesExpected = rsConfig.getNumMembers() / 2;
+    log() << "Simulating dry run responses - expecting " << votesExpected
+          << " replSetRequestVotes requests";
+    net->enterNetwork();
+    while (voteRequests < votesExpected) {
+        if (net->now() < electionTimeoutWhen) {
+            net->runUntil(electionTimeoutWhen);
+        }
+        const NetworkInterfaceMock::NetworkOperationIterator noi = net->getNextReadyRequest();
+        const RemoteCommandRequest& request = noi->getRequest();
+        log() << request.target.toString() << " processing " << request.cmdObj;
+        if (request.cmdObj.firstElement().fieldNameStringData() == "replSetRequestVotes") {
+            ASSERT_TRUE(request.cmdObj.getBoolField("dryRun"));
+            onDryRunRequest(request);
+            net->scheduleResponse(
+                noi,
+                net->now(),
+                makeResponseStatus(BSON("ok" << 1 << "reason"
+                                             << ""
+                                             << "term" << request.cmdObj["term"].Long()
+                                             << "voteGranted" << true)));
+            voteRequests++;
+        } else {
+            error() << "Black holing unexpected request to " << request.target << ": "
+                    << request.cmdObj;
+            net->blackHole(noi);
+        }
+        net->runReadyNetworkOperations();
+    }
+    net->exitNetwork();
+    log() << "Simulating dry run responses - scheduled " << voteRequests
+          << " replSetRequestVotes responses";
+    getReplCoord()->waitForElectionDryRunFinish_forTest();
+    log() << "Simulating dry run responses - dry run completed";
+}
+
+void ReplCoordTest::simulateSuccessfulDryRun() {
+    auto onDryRunRequest = [](const RemoteCommandRequest& request) {};
+    simulateSuccessfulDryRun(onDryRunRequest);
 }
 
 void ReplCoordTest::simulateSuccessfulV1Election() {
     OperationContextReplMock txn;
     ReplicationCoordinatorImpl* replCoord = getReplCoord();
     NetworkInterfaceMock* net = getNet();
+
+    auto electionTimeoutWhen = replCoord->getElectionTimeout_forTest();
+    ASSERT_NOT_EQUALS(Date_t(), electionTimeoutWhen);
+    log() << "Election timeout scheduled at " << electionTimeoutWhen << " (simulator time)";
+
     ReplicaSetConfig rsConfig = replCoord->getReplicaSetConfig_forTest();
     ASSERT(replCoord->getMemberState().secondary()) << replCoord->getMemberState().toString();
     while (!replCoord->getMemberState().primary()) {
         log() << "Waiting on network in state " << replCoord->getMemberState();
         getNet()->enterNetwork();
+        if (net->now() < electionTimeoutWhen) {
+            net->runUntil(electionTimeoutWhen);
+        }
         const NetworkInterfaceMock::NetworkOperationIterator noi = net->getNextReadyRequest();
         const RemoteCommandRequest& request = noi->getRequest();
         log() << request.target.toString() << " processing " << request.cmdObj;
@@ -218,6 +279,11 @@ void ReplCoordTest::simulateSuccessfulV1Election() {
     ASSERT_FALSE(imResponse.isSecondary()) << imResponse.toBSON().toString();
 
     ASSERT(replCoord->getMemberState().primary()) << replCoord->getMemberState().toString();
+
+    // Consume the notification of election win.
+    for (int i = 0; i < rsConfig.getNumMembers() - 1; i++) {
+        replyToReceivedHeartbeatV1();
+    }
 }
 
 void ReplCoordTest::simulateSuccessfulElection() {
@@ -274,31 +340,10 @@ void ReplCoordTest::simulateSuccessfulElection() {
     ASSERT_FALSE(imResponse.isSecondary()) << imResponse.toBSON().toString();
 
     ASSERT(replCoord->getMemberState().primary()) << replCoord->getMemberState().toString();
-}
 
-void ReplCoordTest::simulateStepDownOnIsolation() {
-    ReplicationCoordinatorImpl* replCoord = getReplCoord();
-    NetworkInterfaceMock* net = getNet();
-    ReplicaSetConfig rsConfig = replCoord->getReplicaSetConfig_forTest();
-    ASSERT(replCoord->getMemberState().primary()) << replCoord->getMemberState().toString();
-    while (replCoord->getMemberState().primary()) {
-        log() << "Waiting on network in state " << replCoord->getMemberState();
-        getNet()->enterNetwork();
-        net->runUntil(net->now() + Seconds(10));
-        const NetworkInterfaceMock::NetworkOperationIterator noi = net->getNextReadyRequest();
-        const RemoteCommandRequest& request = noi->getRequest();
-        log() << request.target.toString() << " processing " << request.cmdObj;
-        ReplSetHeartbeatArgs hbArgs;
-        if (hbArgs.initialize(request.cmdObj).isOK()) {
-            net->scheduleResponse(
-                noi, net->now(), ResponseStatus(ErrorCodes::NetworkTimeout, "Nobody's home"));
-        } else {
-            error() << "Black holing unexpected request to " << request.target << ": "
-                    << request.cmdObj;
-            net->blackHole(noi);
-        }
-        net->runReadyNetworkOperations();
-        getNet()->exitNetwork();
+    // Consume the notification of election win.
+    for (int i = 0; i < rsConfig.getNumMembers() - 1; i++) {
+        replyToReceivedHeartbeat();
     }
 }
 
@@ -313,6 +358,46 @@ int64_t ReplCoordTest::countLogLinesContaining(const std::string& needle) {
     return std::count_if(getCapturedLogMessages().begin(),
                          getCapturedLogMessages().end(),
                          stdx::bind(stringContains, stdx::placeholders::_1, needle));
+}
+
+void ReplCoordTest::replyToReceivedHeartbeat() {
+    NetworkInterfaceMock* net = getNet();
+    net->enterNetwork();
+    const NetworkInterfaceMock::NetworkOperationIterator noi = net->getNextReadyRequest();
+    const RemoteCommandRequest& request = noi->getRequest();
+    const ReplicaSetConfig rsConfig = getReplCoord()->getReplicaSetConfig_forTest();
+    repl::ReplSetHeartbeatArgs hbArgs;
+    ASSERT_OK(hbArgs.initialize(request.cmdObj));
+    repl::ReplSetHeartbeatResponse hbResp;
+    hbResp.setSetName(rsConfig.getReplSetName());
+    hbResp.setState(MemberState::RS_SECONDARY);
+    hbResp.setConfigVersion(rsConfig.getConfigVersion());
+    BSONObjBuilder respObj;
+    respObj << "ok" << 1;
+    hbResp.addToBSON(&respObj, false);
+    net->scheduleResponse(noi, net->now(), makeResponseStatus(respObj.obj()));
+    net->runReadyNetworkOperations();
+    getNet()->exitNetwork();
+}
+
+void ReplCoordTest::replyToReceivedHeartbeatV1() {
+    NetworkInterfaceMock* net = getNet();
+    net->enterNetwork();
+    const NetworkInterfaceMock::NetworkOperationIterator noi = net->getNextReadyRequest();
+    const RemoteCommandRequest& request = noi->getRequest();
+    const ReplicaSetConfig rsConfig = getReplCoord()->getReplicaSetConfig_forTest();
+    repl::ReplSetHeartbeatArgsV1 hbArgs;
+    ASSERT_OK(hbArgs.initialize(request.cmdObj));
+    repl::ReplSetHeartbeatResponse hbResp;
+    hbResp.setSetName(rsConfig.getReplSetName());
+    hbResp.setState(MemberState::RS_SECONDARY);
+    hbResp.setConfigVersion(rsConfig.getConfigVersion());
+    BSONObjBuilder respObj;
+    respObj << "ok" << 1;
+    hbResp.addToBSON(&respObj, false);
+    net->scheduleResponse(noi, net->now(), makeResponseStatus(respObj.obj()));
+    net->runReadyNetworkOperations();
+    getNet()->exitNetwork();
 }
 
 }  // namespace repl

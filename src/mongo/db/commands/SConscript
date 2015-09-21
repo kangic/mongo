@@ -9,9 +9,20 @@ env.Library(
         'server_status_metric.cpp',
         ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/bson/bson'
+        '$BUILD_DIR/mongo/base'
         ]
     )
+
+env.Library(
+    target='killcursors_common',
+    source=[
+        'killcursors_common.cpp',
+    ],
+    LIBDEPS=[
+        "$BUILD_DIR/mongo/db/coredb",
+        '$BUILD_DIR/mongo/db/query/command_request_response',
+    ],
+)
 
 env.CppUnitTest(
     target="index_filter_commands_test",

@@ -30,9 +30,14 @@
 
 #include "mongo/db/query/explain.h"
 
-
 #include "mongo/base/owned_pointer_vector.h"
+#include "mongo/db/exec/count_scan.h"
+#include "mongo/db/exec/distinct_scan.h"
+#include "mongo/db/exec/idhack.h"
+#include "mongo/db/exec/index_scan.h"
 #include "mongo/db/exec/multi_plan.h"
+#include "mongo/db/exec/near.h"
+#include "mongo/db/exec/text.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/query/query_planner.h"
@@ -66,9 +71,9 @@ void flattenStatsTree(const PlanStageStats* root, vector<const PlanStageStats*>*
  */
 void flattenExecTree(const PlanStage* root, vector<const PlanStage*>* flattened) {
     flattened->push_back(root);
-    vector<PlanStage*> children = root->getChildren();
+    const auto& children = root->getChildren();
     for (size_t i = 0; i < children.size(); ++i) {
-        flattenExecTree(children[i], flattened);
+        flattenExecTree(children[i].get(), flattened);
     }
 }
 
@@ -82,9 +87,9 @@ MultiPlanStage* getMultiPlanStage(PlanStage* root) {
         return mps;
     }
 
-    vector<PlanStage*> children = root->getChildren();
+    const auto& children = root->getChildren();
     for (size_t i = 0; i < children.size(); i++) {
-        MultiPlanStage* mps = getMultiPlanStage(children[i]);
+        MultiPlanStage* mps = getMultiPlanStage(children[i].get());
         if (mps != NULL) {
             return mps;
         }
@@ -109,9 +114,6 @@ size_t getKeysExamined(StageType type, const SpecificStats* specific) {
     } else if (STAGE_IDHACK == type) {
         const IDHackStats* spec = static_cast<const IDHackStats*>(specific);
         return spec->keysExamined;
-    } else if (STAGE_TEXT == type) {
-        const TextStats* spec = static_cast<const TextStats*>(specific);
-        return spec->keysExamined;
     } else if (STAGE_COUNT_SCAN == type) {
         const CountScanStats* spec = static_cast<const CountScanStats*>(specific);
         return spec->keysExamined;
@@ -133,18 +135,18 @@ size_t getKeysExamined(StageType type, const SpecificStats* specific) {
  * (in which case this gets called from Explain::getSummaryStats()).
  */
 size_t getDocsExamined(StageType type, const SpecificStats* specific) {
-    if (STAGE_IDHACK == type) {
-        const IDHackStats* spec = static_cast<const IDHackStats*>(specific);
-        return spec->docsExamined;
-    } else if (STAGE_TEXT == type) {
-        const TextStats* spec = static_cast<const TextStats*>(specific);
-        return spec->fetches;
+    if (STAGE_COLLSCAN == type) {
+        const CollectionScanStats* spec = static_cast<const CollectionScanStats*>(specific);
+        return spec->docsTested;
     } else if (STAGE_FETCH == type) {
         const FetchStats* spec = static_cast<const FetchStats*>(specific);
         return spec->docsExamined;
-    } else if (STAGE_COLLSCAN == type) {
-        const CollectionScanStats* spec = static_cast<const CollectionScanStats*>(specific);
-        return spec->docsTested;
+    } else if (STAGE_IDHACK == type) {
+        const IDHackStats* spec = static_cast<const IDHackStats*>(specific);
+        return spec->docsExamined;
+    } else if (STAGE_TEXT_OR == type) {
+        const TextOrStats* spec = static_cast<const TextOrStats*>(specific);
+        return spec->fetches;
     }
 
     return 0;
@@ -282,6 +284,27 @@ void Explain::statsToBSON(const PlanStageStats& stats,
             bob->appendNumber("nWouldDelete", spec->docsDeleted);
             bob->appendNumber("nInvalidateSkips", spec->nInvalidateSkips);
         }
+    } else if (STAGE_DISTINCT_SCAN == stats.stageType) {
+        DistinctScanStats* spec = static_cast<DistinctScanStats*>(stats.specific.get());
+
+        bob->append("keyPattern", spec->keyPattern);
+        bob->append("indexName", spec->indexName);
+        bob->appendBool("isMultiKey", spec->isMultiKey);
+        bob->appendBool("isUnique", spec->isUnique);
+        bob->appendBool("isSparse", spec->isSparse);
+        bob->appendBool("isPartial", spec->isPartial);
+        bob->append("indexVersion", spec->indexVersion);
+        bob->append("direction", spec->direction > 0 ? "forward" : "backward");
+
+        if ((topLevelBob->len() + spec->indexBounds.objsize()) > kMaxStatsBSONSize) {
+            bob->append("warning", "index bounds omitted due to BSON size limit");
+        } else {
+            bob->append("indexBounds", spec->indexBounds);
+        }
+
+        if (verbosity >= ExplainCommon::EXEC_STATS) {
+            bob->appendNumber("keysExamined", spec->keysExamined);
+        }
     } else if (STAGE_FETCH == stats.stageType) {
         FetchStats* spec = static_cast<FetchStats*>(stats.specific.get());
         if (verbosity >= ExplainCommon::EXEC_STATS) {
@@ -303,6 +326,8 @@ void Explain::statsToBSON(const PlanStageStats& stats,
                 intervalBob.append("minDistance", it->minDistanceAllowed);
                 intervalBob.append("maxDistance", it->maxDistanceAllowed);
                 intervalBob.append("maxInclusive", it->inclusiveMaxDistanceAllowed);
+                intervalBob.appendNumber("nBuffered", it->numResultsBuffered);
+                intervalBob.appendNumber("nReturned", it->numResultsReturned);
             }
             intervalsBob.doneFast();
         }
@@ -387,14 +412,21 @@ void Explain::statsToBSON(const PlanStageStats& stats,
     } else if (STAGE_TEXT == stats.stageType) {
         TextStats* spec = static_cast<TextStats*>(stats.specific.get());
 
-        if (verbosity >= ExplainCommon::EXEC_STATS) {
-            bob->appendNumber("keysExamined", spec->keysExamined);
-            bob->appendNumber("docsExamined", spec->fetches);
-        }
-
         bob->append("indexPrefix", spec->indexPrefix);
         bob->append("indexName", spec->indexName);
         bob->append("parsedTextQuery", spec->parsedTextQuery);
+    } else if (STAGE_TEXT_MATCH == stats.stageType) {
+        TextMatchStats* spec = static_cast<TextMatchStats*>(stats.specific.get());
+
+        if (verbosity >= ExplainCommon::EXEC_STATS) {
+            bob->appendNumber("docsRejected", spec->docsRejected);
+        }
+    } else if (STAGE_TEXT_OR == stats.stageType) {
+        TextOrStats* spec = static_cast<TextOrStats*>(stats.specific.get());
+
+        if (verbosity >= ExplainCommon::EXEC_STATS) {
+            bob->appendNumber("docsExamined", spec->fetches);
+        }
     } else if (STAGE_UPDATE == stats.stageType) {
         UpdateStats* spec = static_cast<UpdateStats*>(stats.specific.get());
 
@@ -506,12 +538,12 @@ void Explain::generatePlannerInfo(PlanExecutor* exec,
 void Explain::generateExecStats(PlanStageStats* stats,
                                 ExplainCommon::Verbosity verbosity,
                                 BSONObjBuilder* out,
-                                long long totalTimeMillis) {
+                                boost::optional<long long> totalTimeMillis) {
     out->appendNumber("nReturned", stats->common.advanced);
 
     // Time elapsed could might be either precise or approximate.
-    if (totalTimeMillis >= 0) {
-        out->appendNumber("executionTimeMillis", totalTimeMillis);
+    if (totalTimeMillis) {
+        out->appendNumber("executionTimeMillis", *totalTimeMillis);
     } else {
         out->appendNumber("executionTimeMillisEstimate", stats->common.executionTimeMillis);
     }
@@ -565,7 +597,7 @@ void Explain::explainStages(PlanExecutor* exec,
     // is high enough and there was a runoff between multiple plans.
     unique_ptr<PlanStageStats> winningStatsTrial;
     if (verbosity >= ExplainCommon::EXEC_ALL_PLANS && NULL != mps) {
-        winningStatsTrial.reset(exec->getStats());
+        winningStatsTrial = exec->getStats();
         invariant(winningStatsTrial.get());
     }
 
@@ -627,7 +659,7 @@ void Explain::explainStages(PlanExecutor* exec,
             BSONArrayBuilder allPlansBob(execBob.subarrayStart("allPlansExecution"));
             for (size_t i = 0; i < allPlansStats.size(); ++i) {
                 BSONObjBuilder planBob(allPlansBob.subobjStart());
-                generateExecStats(allPlansStats[i], verbosity, &planBob);
+                generateExecStats(allPlansStats[i], verbosity, &planBob, boost::none);
                 planBob.doneFast();
             }
             allPlansBob.doneFast();
@@ -670,10 +702,10 @@ std::string Explain::getPlanSummary(const PlanStage* root) {
 }
 
 // static
-void Explain::getSummaryStats(const PlanExecutor* exec, PlanSummaryStats* statsOut) {
+void Explain::getSummaryStats(const PlanExecutor& exec, PlanSummaryStats* statsOut) {
     invariant(NULL != statsOut);
 
-    PlanStage* root = exec->getRootStage();
+    PlanStage* root = exec.getRootStage();
 
     // We can get some of the fields we need from the common stats stored in the
     // root stage of the plan tree.
@@ -697,6 +729,39 @@ void Explain::getSummaryStats(const PlanExecutor* exec, PlanSummaryStats* statsO
         }
         if (STAGE_SORT == stages[i]->stageType()) {
             statsOut->hasSortStage = true;
+        }
+
+        if (STAGE_IXSCAN == stages[i]->stageType()) {
+            const IndexScan* ixscan = static_cast<const IndexScan*>(stages[i]);
+            const IndexScanStats* ixscanStats =
+                static_cast<const IndexScanStats*>(ixscan->getSpecificStats());
+            statsOut->indexesUsed.insert(ixscanStats->indexName);
+        } else if (STAGE_COUNT_SCAN == stages[i]->stageType()) {
+            const CountScan* countScan = static_cast<const CountScan*>(stages[i]);
+            const CountScanStats* countScanStats =
+                static_cast<const CountScanStats*>(countScan->getSpecificStats());
+            statsOut->indexesUsed.insert(countScanStats->indexName);
+        } else if (STAGE_IDHACK == stages[i]->stageType()) {
+            const IDHackStage* idHackStage = static_cast<const IDHackStage*>(stages[i]);
+            const IDHackStats* idHackStats =
+                static_cast<const IDHackStats*>(idHackStage->getSpecificStats());
+            statsOut->indexesUsed.insert(idHackStats->indexName);
+        } else if (STAGE_DISTINCT_SCAN == stages[i]->stageType()) {
+            const DistinctScan* distinctScan = static_cast<const DistinctScan*>(stages[i]);
+            const DistinctScanStats* distinctScanStats =
+                static_cast<const DistinctScanStats*>(distinctScan->getSpecificStats());
+            statsOut->indexesUsed.insert(distinctScanStats->indexName);
+        } else if (STAGE_TEXT == stages[i]->stageType()) {
+            const TextStage* textStage = static_cast<const TextStage*>(stages[i]);
+            const TextStats* textStats =
+                static_cast<const TextStats*>(textStage->getSpecificStats());
+            statsOut->indexesUsed.insert(textStats->indexName);
+        } else if (STAGE_GEO_NEAR_2D == stages[i]->stageType() ||
+                   STAGE_GEO_NEAR_2DSPHERE == stages[i]->stageType()) {
+            const NearStage* nearStage = static_cast<const NearStage*>(stages[i]);
+            const NearStats* nearStats =
+                static_cast<const NearStats*>(nearStage->getSpecificStats());
+            statsOut->indexesUsed.insert(nearStats->indexName);
         }
     }
 }

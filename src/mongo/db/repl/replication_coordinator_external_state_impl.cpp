@@ -51,12 +51,13 @@
 #include "mongo/db/repl/last_vote.h"
 #include "mongo/db/repl/master_slave.h"
 #include "mongo/db/repl/oplog.h"
-#include "mongo/db/repl/replication_executor.h"
 #include "mongo/db/repl/rs_sync.h"
+#include "mongo/db/repl/snapshot_thread.h"
+#include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/executor/network_interface.h"
-#include "mongo/s/d_state.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/assert_util.h"
@@ -77,6 +78,10 @@ const char lastVoteDatabaseName[] = "local";
 const char meCollectionName[] = "local.me";
 const char meDatabaseName[] = "local";
 const char tsFieldName[] = "ts";
+
+// Set this to false to disable the background creation of snapshots. This can be used for A-B
+// benchmarking to find how much overhead repl::SnapshotThread introduces.
+MONGO_EXPORT_STARTUP_SERVER_PARAMETER(enableReplSnapshotThread, bool, true);
 }  // namespace
 
 ReplicationCoordinatorExternalStateImpl::ReplicationCoordinatorExternalStateImpl()
@@ -94,6 +99,9 @@ void ReplicationCoordinatorExternalStateImpl::startThreads() {
     _producerThread.reset(new stdx::thread(stdx::bind(&BackgroundSync::producerThread, bgsync)));
     _syncSourceFeedbackThread.reset(
         new stdx::thread(stdx::bind(&SyncSourceFeedback::run, &_syncSourceFeedback)));
+    if (enableReplSnapshotThread) {
+        _snapshotThread = SnapshotThread::start(getGlobalServiceContext());
+    }
     _startedThreads = true;
 }
 
@@ -111,23 +119,59 @@ void ReplicationCoordinatorExternalStateImpl::shutdown() {
         BackgroundSync* bgsync = BackgroundSync::get();
         bgsync->shutdown();
         _producerThread->join();
+
+        if (_snapshotThread)
+            _snapshotThread->shutdown();
     }
 }
 
-void ReplicationCoordinatorExternalStateImpl::initiateOplog(OperationContext* txn) {
-    createOplog(txn);
+void ReplicationCoordinatorExternalStateImpl::initiateOplog(OperationContext* txn,
+                                                            bool updateReplOpTime) {
+    createOplog(txn, rsOplogName, true);
 
     MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
         ScopedTransaction scopedXact(txn, MODE_X);
         Lock::GlobalWrite globalWrite(txn->lockState());
 
         WriteUnitOfWork wuow(txn);
-        getGlobalServiceContext()->getOpObserver()->onOpMessage(txn,
-                                                                BSON("msg"
-                                                                     << "initiating set"));
+
+        const auto msgObj = BSON("msg"
+                                 << "initiating set");
+        if (updateReplOpTime) {
+            getGlobalServiceContext()->getOpObserver()->onOpMessage(txn, msgObj);
+        } else {
+            // 'updateReplOpTime' is false when called from the replSetInitiate command when the
+            // server is running with replication disabled. We bypass onOpMessage to invoke _logOp
+            // directly so that we can override the replication mode and keep _logO from updating
+            // the replication coordinator's op time (illegal operation when replication is not
+            // enabled).
+            repl::_logOp(txn,
+                         "n",
+                         "",
+                         msgObj,
+                         nullptr,
+                         false,
+                         rsOplogName,
+                         ReplicationCoordinator::modeReplSet,
+                         updateReplOpTime);
+        }
         wuow.commit();
     }
     MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "initiate oplog entry", "local.oplog.rs");
+}
+
+void ReplicationCoordinatorExternalStateImpl::logTransitionToPrimaryToOplog(OperationContext* txn) {
+    MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+        ScopedTransaction scopedXact(txn, MODE_X);
+
+        WriteUnitOfWork wuow(txn);
+        txn->getClient()->getServiceContext()->getOpObserver()->onOpMessage(txn,
+                                                                            BSON("msg"
+                                                                                 << "new primary"));
+        wuow.commit();
+    }
+    MONGO_WRITE_CONFLICT_RETRY_LOOP_END(
+        txn, "logging transition to primary to oplog", "local.oplog.rs");
 }
 
 void ReplicationCoordinatorExternalStateImpl::forwardSlaveProgress() {
@@ -263,7 +307,7 @@ StatusWith<OpTime> ReplicationCoordinatorExternalStateImpl::loadLastOpTime(Opera
                                                     << " entry to have type Timestamp, but found "
                                                     << typeName(tsElement.type()));
         }
-        return StatusWith<OpTime>(extractOpTime(oplogEntry));
+        return OpTime::parseFromOplogEntry(oplogEntry);
     } catch (const DBException& ex) {
         return StatusWith<OpTime>(ex.toStatus());
     }
@@ -288,11 +332,15 @@ void ReplicationCoordinatorExternalStateImpl::killAllUserOperations(OperationCon
 }
 
 void ReplicationCoordinatorExternalStateImpl::clearShardingState() {
-    shardingState.clearCollectionMetadata();
+    ShardingState::get(getGlobalServiceContext())->clearCollectionMetadata();
 }
 
 void ReplicationCoordinatorExternalStateImpl::signalApplierToChooseNewSyncSource() {
     BackgroundSync::get()->clearSyncTarget();
+}
+
+void ReplicationCoordinatorExternalStateImpl::signalApplierToCancelFetcher() {
+    BackgroundSync::get()->cancelFetcher();
 }
 
 OperationContext* ReplicationCoordinatorExternalStateImpl::createOperationContext(
@@ -321,5 +369,24 @@ void ReplicationCoordinatorExternalStateImpl::dropAllTempCollections(OperationCo
     }
 }
 
+void ReplicationCoordinatorExternalStateImpl::dropAllSnapshots() {
+    if (auto manager = getGlobalServiceContext()->getGlobalStorageEngine()->getSnapshotManager())
+        manager->dropAllSnapshots();
+}
+
+void ReplicationCoordinatorExternalStateImpl::updateCommittedSnapshot(SnapshotName newCommitPoint) {
+    auto manager = getGlobalServiceContext()->getGlobalStorageEngine()->getSnapshotManager();
+    invariant(manager);  // This should never be called if there is no SnapshotManager.
+    manager->setCommittedSnapshot(newCommitPoint);
+}
+
+void ReplicationCoordinatorExternalStateImpl::forceSnapshotCreation() {
+    if (_snapshotThread)
+        _snapshotThread->forceSnapshot();
+}
+
+bool ReplicationCoordinatorExternalStateImpl::snapshotsEnabled() const {
+    return _snapshotThread != nullptr;
+}
 }  // namespace repl
 }  // namespace mongo

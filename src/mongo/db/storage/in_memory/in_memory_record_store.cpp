@@ -109,10 +109,10 @@ private:
     Records _records;
 };
 
-class InMemoryRecordStore::Cursor final : public RecordCursor {
+class InMemoryRecordStore::Cursor final : public SeekableRecordCursor {
 public:
     Cursor(OperationContext* txn, const InMemoryRecordStore& rs)
-        : _txn(txn), _records(rs._data->records), _isCapped(rs.isCapped()) {}
+        : _records(rs._data->records), _isCapped(rs.isCapped()) {}
 
     boost::optional<Record> next() final {
         if (_needFirstSeek) {
@@ -137,19 +137,16 @@ public:
         return {{_it->first, _it->second.toRecordData()}};
     }
 
-    void savePositioned() final {
-        _txn = nullptr;
+    void save() final {
         if (!_needFirstSeek && !_lastMoveWasRestore)
             _savedId = _it == _records.end() ? RecordId() : _it->first;
     }
 
     void saveUnpositioned() final {
-        _txn = nullptr;
         _savedId = RecordId();
     }
 
-    bool restore(OperationContext* txn) final {
-        _txn = txn;
+    bool restore() final {
         if (_savedId.isNull()) {
             _it = _records.end();
             return true;
@@ -162,8 +159,10 @@ public:
         return !(_isCapped && _lastMoveWasRestore);
     }
 
+    void detachFromOperationContext() final {}
+    void reattachToOperationContext(OperationContext* txn) final {}
+
 private:
-    unowned_ptr<OperationContext> _txn;
     Records::const_iterator _it;
     bool _needFirstSeek = true;
     bool _lastMoveWasRestore = false;
@@ -173,10 +172,10 @@ private:
     const bool _isCapped;
 };
 
-class InMemoryRecordStore::ReverseCursor final : public RecordCursor {
+class InMemoryRecordStore::ReverseCursor final : public SeekableRecordCursor {
 public:
     ReverseCursor(OperationContext* txn, const InMemoryRecordStore& rs)
-        : _txn(txn), _records(rs._data->records), _isCapped(rs.isCapped()) {}
+        : _records(rs._data->records), _isCapped(rs.isCapped()) {}
 
     boost::optional<Record> next() final {
         if (_needFirstSeek) {
@@ -211,19 +210,16 @@ public:
         return {{_it->first, _it->second.toRecordData()}};
     }
 
-    void savePositioned() final {
-        _txn = nullptr;
+    void save() final {
         if (!_needFirstSeek && !_lastMoveWasRestore)
             _savedId = _it == _records.rend() ? RecordId() : _it->first;
     }
 
     void saveUnpositioned() final {
-        _txn = nullptr;
         _savedId = RecordId();
     }
 
-    bool restore(OperationContext* txn) final {
-        _txn = txn;
+    bool restore() final {
         if (_savedId.isNull()) {
             _it = _records.rend();
             return true;
@@ -239,8 +235,10 @@ public:
         return !(_isCapped && _lastMoveWasRestore);
     }
 
+    void detachFromOperationContext() final {}
+    void reattachToOperationContext(OperationContext* txn) final {}
+
 private:
-    unowned_ptr<OperationContext> _txn;
     Records::const_reverse_iterator _it;
     bool _needFirstSeek = true;
     bool _lastMoveWasRestore = false;
@@ -259,12 +257,12 @@ InMemoryRecordStore::InMemoryRecordStore(StringData ns,
                                          bool isCapped,
                                          int64_t cappedMaxSize,
                                          int64_t cappedMaxDocs,
-                                         CappedDocumentDeleteCallback* cappedDeleteCallback)
+                                         CappedCallback* cappedCallback)
     : RecordStore(ns),
       _isCapped(isCapped),
       _cappedMaxSize(cappedMaxSize),
       _cappedMaxDocs(cappedMaxDocs),
-      _cappedDeleteCallback(cappedDeleteCallback),
+      _cappedCallback(cappedCallback),
       _data(*dataInOut ? static_cast<Data*>(dataInOut->get())
                        : new Data(NamespaceString::oplog(ns))) {
     if (!*dataInOut) {
@@ -346,8 +344,8 @@ void InMemoryRecordStore::cappedDeleteAsNeeded(OperationContext* txn) {
         RecordId id = oldest->first;
         RecordData data = oldest->second.toRecordData();
 
-        if (_cappedDeleteCallback)
-            uassertStatusOK(_cappedDeleteCallback->aboutToDeleteCapped(txn, id, data));
+        if (_cappedCallback)
+            uassertStatusOK(_cappedCallback->aboutToDeleteCapped(txn, id, data));
 
         deleteRecord(txn, id);
     }
@@ -439,8 +437,8 @@ StatusWith<RecordId> InMemoryRecordStore::updateRecord(OperationContext* txn,
     int oldLen = oldRecord->size;
 
     if (_isCapped && len > oldLen) {
-        return StatusWith<RecordId>(
-            ErrorCodes::InternalError, "failing update: objects in a capped ns cannot grow", 10003);
+        return {ErrorCodes::CannotGrowDocumentInCappedNamespace,
+                "failing update: objects in a capped ns cannot grow"};
     }
 
     if (notifier) {
@@ -465,21 +463,15 @@ StatusWith<RecordId> InMemoryRecordStore::updateRecord(OperationContext* txn,
 }
 
 bool InMemoryRecordStore::updateWithDamagesSupported() const {
-    // TODO: Currently the UpdateStage assumes that updateWithDamages will apply the
-    // damages directly to the unowned BSONObj containing the record to be modified.
-    // The implementation of updateWithDamages() below copies the old record to a
-    // a new one and then applies the damages.
-    //
-    // We should be able to enable updateWithDamages() here once this assumption is
-    // relaxed.
-    return false;
+    return true;
 }
 
-Status InMemoryRecordStore::updateWithDamages(OperationContext* txn,
-                                              const RecordId& loc,
-                                              const RecordData& oldRec,
-                                              const char* damageSource,
-                                              const mutablebson::DamageVector& damages) {
+StatusWith<RecordData> InMemoryRecordStore::updateWithDamages(
+    OperationContext* txn,
+    const RecordId& loc,
+    const RecordData& oldRec,
+    const char* damageSource,
+    const mutablebson::DamageVector& damages) {
     InMemoryRecord* oldRecord = recordFor(loc);
     const int len = oldRecord->size;
 
@@ -502,11 +494,11 @@ Status InMemoryRecordStore::updateWithDamages(OperationContext* txn,
 
     *oldRecord = newRecord;
 
-    return Status::OK();
+    return newRecord.toRecordData();
 }
 
-std::unique_ptr<RecordCursor> InMemoryRecordStore::getCursor(OperationContext* txn,
-                                                             bool forward) const {
+std::unique_ptr<SeekableRecordCursor> InMemoryRecordStore::getCursor(OperationContext* txn,
+                                                                     bool forward) const {
     if (forward)
         return stdx::make_unique<Cursor>(txn, *this);
     return stdx::make_unique<ReverseCursor>(txn, *this);

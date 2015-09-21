@@ -50,7 +50,7 @@ public:
                                  bool isCapped = false,
                                  int64_t cappedMaxSize = -1,
                                  int64_t cappedMaxDocs = -1,
-                                 CappedDocumentDeleteCallback* cappedDeleteCallback = NULL);
+                                 CappedCallback* cappedCallback = nullptr);
 
     virtual const char* name() const;
 
@@ -78,13 +78,14 @@ public:
 
     virtual bool updateWithDamagesSupported() const;
 
-    virtual Status updateWithDamages(OperationContext* txn,
-                                     const RecordId& loc,
-                                     const RecordData& oldRec,
-                                     const char* damageSource,
-                                     const mutablebson::DamageVector& damages);
+    virtual StatusWith<RecordData> updateWithDamages(OperationContext* txn,
+                                                     const RecordId& loc,
+                                                     const RecordData& oldRec,
+                                                     const char* damageSource,
+                                                     const mutablebson::DamageVector& damages);
 
-    std::unique_ptr<RecordCursor> getCursor(OperationContext* txn, bool forward) const final;
+    std::unique_ptr<SeekableRecordCursor> getCursor(OperationContext* txn,
+                                                    bool forward) const final;
 
     virtual Status truncate(OperationContext* txn);
 
@@ -153,8 +154,8 @@ public:
     bool isCapped() const {
         return _isCapped;
     }
-    void setCappedDeleteCallback(CappedDocumentDeleteCallback* cb) {
-        _cappedDeleteCallback = cb;
+    void setCappedCallback(CappedCallback* cb) {
+        _cappedCallback = cb;
     }
     bool cappedMaxDocs() const {
         invariant(_isCapped);
@@ -183,7 +184,7 @@ private:
     const bool _isCapped;
     const int64_t _cappedMaxSize;
     const int64_t _cappedMaxDocs;
-    CappedDocumentDeleteCallback* _cappedDeleteCallback;
+    CappedCallback* _cappedCallback;
 
     // This is the "persistent" data.
     struct Data {

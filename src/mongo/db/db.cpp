@@ -60,6 +60,7 @@
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/dbwebserver.h"
+#include "mongo/db/ftdc/ftdc_mongod.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/index_rebuilder.h"
 #include "mongo/db/initialize_server_global_state.h"
@@ -81,6 +82,7 @@
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/repl/topology_coordinator_impl.h"
 #include "mongo/db/restapi.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_d.h"
@@ -89,9 +91,10 @@
 #include "mongo/db/stats/snapshots.h"
 #include "mongo/db/storage/mmap_v1/mmap_v1_options.h"
 #include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_customization_hooks.h"
 #include "mongo/db/storage_options.h"
 #include "mongo/db/ttl.h"
-#include "mongo/executor/network_interface_impl.h"
+#include "mongo/executor/network_interface_factory.h"
 #include "mongo/platform/process_id.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/stdx/memory.h"
@@ -145,8 +148,6 @@ ntservice::NtServiceDefaultStrings defaultServiceStrings = {
 #endif
 
 Timer startupSrandTimer;
-
-QueryResult::View emptyMoreResult(long long);
 
 class MyMessageHandler : public MessageHandler {
 public:
@@ -239,7 +240,7 @@ static void logStartup() {
         collection = db->getCollection(ns);
     }
     invariant(collection);
-    uassertStatusOK(collection->insertDocument(&txn, o, false).getStatus());
+    uassertStatusOK(collection->insertDocument(&txn, o, false));
     wunit.commit();
 }
 
@@ -345,7 +346,8 @@ static void repairDatabasesAndCheckVersion() {
         const string systemIndexes = db->name() + ".system.indexes";
 
         Collection* coll = db->getCollection(systemIndexes);
-        unique_ptr<PlanExecutor> exec(InternalPlanner::collectionScan(&txn, systemIndexes, coll));
+        unique_ptr<PlanExecutor> exec(
+            InternalPlanner::collectionScan(&txn, systemIndexes, coll, PlanExecutor::YIELD_MANUAL));
 
         BSONObj index;
         PlanExecutor::ExecState state;
@@ -415,6 +417,12 @@ static void _initAndListen(int listenPort) {
 
     getGlobalServiceContext()->initializeGlobalStorageEngine();
 
+#ifdef MONGO_CONFIG_WIREDTIGER_ENABLED
+    if (WiredTigerCustomizationHooks::get(getGlobalServiceContext())->restartRequired()) {
+        exitCleanly(EXIT_CLEAN);
+    }
+#endif
+
     // Warn if we detect configurations for multiple registered storage engines in
     // the same configuration file/environment.
     if (serverGlobalParams.parsedOpts.hasField("storage")) {
@@ -457,7 +465,7 @@ static void _initAndListen(int listenPort) {
     }
 
     DEV log(LogComponent::kControl) << "DEBUG build (which is slower)" << endl;
-    logMongodStartupWarnings(storageGlobalParams);
+    logMongodStartupWarnings(storageGlobalParams, serverGlobalParams);
 
 #if defined(_WIN32)
     printTargetMinOS();
@@ -515,7 +523,7 @@ static void _initAndListen(int listenPort) {
     // The snapshot thread provides historical collection level and lock statistics for use
     // by the web interface. Only needed when HTTP is enabled.
     if (serverGlobalParams.isHttpInterfaceEnabled) {
-        snapshotThread.go();
+        statsSnapshotThread.go();
 
         invariant(dbWebServer);
         stdx::thread web(stdx::bind(&webServerListenThread, dbWebServer));
@@ -582,6 +590,8 @@ static void _initAndListen(int listenPort) {
     startClientCursorMonitor();
 
     PeriodicTask::startRunningPeriodicTasks();
+
+    startFTDC();
 
     logStartup();
 
@@ -733,14 +743,25 @@ static void startupConfigActions(const std::vector<std::string>& args) {
 #endif
 }
 
-MONGO_INITIALIZER_WITH_PREREQUISITES(CreateReplicationManager, ("SetGlobalEnvironment"))
+MONGO_INITIALIZER_WITH_PREREQUISITES(CreateReplicationManager,
+                                     ("SetGlobalEnvironment", "SSLManager"))
 (InitializerContext* context) {
+    repl::TopologyCoordinatorImpl::Options topoCoordOptions;
+    topoCoordOptions.maxSyncSourceLagSecs = Seconds(repl::maxSyncSourceLagSecs);
+    topoCoordOptions.configServerMode = serverGlobalParams.configsvrMode;
+    // TODO(SERVER-19739):  Rather than checking if the storage engine name is "wiredTiger"
+    // we should be asking the global storage engine whether it supports readCommitted,
+    // however at this point in mongod startup the storage engine has not yet been
+    // initialized.
+    topoCoordOptions.storageEngineSupportsReadCommitted =
+        storageGlobalParams.engine == "wiredTiger";
+
     auto replCoord = stdx::make_unique<repl::ReplicationCoordinatorImpl>(
         getGlobalReplSettings(),
         new repl::ReplicationCoordinatorExternalStateImpl,
-        new executor::NetworkInterfaceImpl{},
+        executor::makeNetworkInterface().release(),
         new repl::StorageInterfaceImpl{},
-        new repl::TopologyCoordinatorImpl(Seconds(repl::maxSyncSourceLagSecs)),
+        new repl::TopologyCoordinatorImpl(topoCoordOptions),
         static_cast<int64_t>(curTimeMillis64()));
     auto serviceContext = getGlobalServiceContext();
     serviceContext->registerKillOpListener(replCoord.get());

@@ -245,7 +245,7 @@ public:
         void setEndPosition(const BSONObj& key, bool inclusive) override {
             if (key.isEmpty()) {
                 // This means scan to end of index.
-                _endState = {};
+                _endState = boost::none;
                 return;
             }
 
@@ -281,7 +281,7 @@ public:
             return *_it;
         }
 
-        void savePositioned() override {
+        void save() override {
             // Keep original position if we haven't moved since the last restore.
             _txn = nullptr;
             if (_lastMoveWasRestore)
@@ -299,14 +299,11 @@ public:
         }
 
         void saveUnpositioned() override {
-            _txn = nullptr;
             _savedAtEnd = true;
             // Doing nothing with end cursor since it will do full reseek on restore.
         }
 
-        void restore(OperationContext* txn) override {
-            _txn = txn;
-
+        void restore() override {
             // Always do a full seek on restore. We cannot use our last position since index
             // entries may have been inserted closer to our endpoint and we would need to move
             // over them.
@@ -322,6 +319,14 @@ public:
 
             _lastMoveWasRestore = _isEOF  // We weren't EOF but now are.
                 || _data.value_comp().compare(*_it, {_savedKey, _savedLoc}) != 0;
+        }
+
+        void detachFromOperationContext() final {
+            _txn = nullptr;
+        }
+
+        void reattachToOperationContext(OperationContext* txn) final {
+            _txn = txn;
         }
 
     private:
